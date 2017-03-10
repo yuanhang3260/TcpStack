@@ -1,0 +1,47 @@
+#
+# A simulated TCP/IP stack
+#
+# Hang Yuan <yuanhang3260@gmail.com>
+#
+MAKE=make
+CC=g++ -std=c++11
+CFLAGS=-Wall -Werror -O2
+LFLAGS=-lssl -lcrypto -pthread
+IFLAGS=-Isrc/ -Isrc/Public/
+
+SRC_DIR=src
+OBJ_DIR=lib
+
+HYLIB_DIR=../HyLib/
+HYLIB=../HyLib/libhy.a
+
+OBJ = $(OBJ_DIR)/IPHeader.o \
+      $(OBJ_DIR)/TCPHeader.o \
+
+TESTOBJ = $(OBJ_DIR)/XXX_test.o \
+
+TESTEXE = test/XXX_test.out \
+
+all: libhy library
+
+libhy:
+	+$(MAKE) -C $(HYLIB_DIR)
+
+library: $(OBJ)
+	ar cr libtcp.a $(OBJ)
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cc
+	$(CC) $(CFLAGS) $(IFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cc $(SRC_DIR)/%.h
+	$(CC) $(CFLAGS) $(IFLAGS) -c $< -o $@
+
+test/%.out: $(OBJ_DIR)/%.o libtcp.a
+	$(CC) $(CFLAGS) $(LFLAGS) $< libtcp.a $(HYLIB) -o $@
+
+
+clean:
+	rm -rf libtcp.a
+	rm -rf $(OBJ_DIR)/*.o
+	rm -rf test/*.out
+
