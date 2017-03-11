@@ -15,14 +15,21 @@ OBJ_DIR=lib
 HYLIB_DIR=../HyLib/
 HYLIB=../HyLib/libhy.a
 
-OBJ = $(OBJ_DIR)/IPHeader.o \
+OBJ = $(OBJ_DIR)/BaseChannel.o \
+      $(OBJ_DIR)/IPHeader.o \
       $(OBJ_DIR)/TCPHeader.o \
+      $(OBJ_DIR)/Packet.o \
+      $(OBJ_DIR)/PacketQueue.o \
 
-TESTOBJ = $(OBJ_DIR)/XXX_test.o \
+TESTOBJ = $(OBJ_DIR)/PacketQueue_test.o \
+          $(OBJ_DIR)/BaseChannel_test.o \
 
-TESTEXE = test/XXX_test.out \
+TESTEXE = test/PacketQueue_test.out \
+          test/BaseChannel_test.out \
 
 all: libhy library
+
+test: $(TESTEXE)
 
 libhy:
 	+$(MAKE) -C $(HYLIB_DIR)
@@ -36,7 +43,7 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cc
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cc $(SRC_DIR)/%.h
 	$(CC) $(CFLAGS) $(IFLAGS) -c $< -o $@
 
-test/%.out: $(OBJ_DIR)/%.o libtcp.a
+test/%.out: $(OBJ_DIR)/%.o library
 	$(CC) $(CFLAGS) $(LFLAGS) $< libtcp.a $(HYLIB) -o $@
 
 
@@ -44,4 +51,3 @@ clean:
 	rm -rf libtcp.a
 	rm -rf $(OBJ_DIR)/*.o
 	rm -rf test/*.out
-
