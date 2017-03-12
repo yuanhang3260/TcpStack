@@ -16,10 +16,12 @@ HYLIB_DIR=../HyLib/
 HYLIB=../HyLib/libhy.a
 
 OBJ = $(OBJ_DIR)/BaseChannel.o \
+			$(OBJ_DIR)/Host.o \
       $(OBJ_DIR)/IPHeader.o \
-      $(OBJ_DIR)/TCPHeader.o \
       $(OBJ_DIR)/Packet.o \
       $(OBJ_DIR)/PacketQueue.o \
+      $(OBJ_DIR)/TcpHeader.o \
+      $(OBJ_DIR)/TcpController.o \
 
 TESTOBJ = $(OBJ_DIR)/PacketQueue_test.o \
           $(OBJ_DIR)/BaseChannel_test.o \

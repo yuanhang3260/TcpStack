@@ -11,7 +11,7 @@ class PacketQueueTest: public UnitTest {
  public:
   void setup() {
     IPHeader ip_header;
-    TCPHeader tcp_header;
+    TcpHeader tcp_header;
     tcp_header.seq_num = 1;
     auto pkt1 = ptr::MakeUnique<Packet>(ip_header, tcp_header);
     tcp_header.seq_num = 2;

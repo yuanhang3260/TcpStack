@@ -24,7 +24,7 @@ class BaseChannelTest: public UnitTest {
 
   std::unique_ptr<Packet> MakePacket(int tcp_seq_num) {
     IPHeader ip_header;
-    TCPHeader tcp_header;
+    TcpHeader tcp_header;
     tcp_header.seq_num = tcp_seq_num;
     auto pkt = ptr::MakeUnique<Packet>(ip_header, tcp_header);
     return pkt;

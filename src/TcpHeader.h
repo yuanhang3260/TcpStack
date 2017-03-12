@@ -5,7 +5,7 @@
 
 namespace net_stack {
 
-struct TCPHeader {
+struct TcpHeader {
   uint16 source_port = 0;
   uint16 dest_port = 0;
   uint32 seq_num = 0;

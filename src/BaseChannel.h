@@ -12,10 +12,11 @@
 
 namespace net_stack {
 
-// This is a abstraction of network channel with unlimited volume. Basically
-// sender just call Send to push new packet into the channel and receiver on
-// the other side will be notified to receive. It can simulate data corruption,
-// packet loss and transmit delay to behave as an unreliable channel.
+// This is an abstraction of network channel with unlimited volume. Note this is
+// a unidirection channel. Basically senders call Send to push new packet into
+// the channel and receiver on the other side will be notified to receive.
+// It can simulate data corruption, packet loss and transmit delay to behave as
+// an unreliable channel.
 //
 // This class is thread-safe, meaning it supports multiple senders sending
 // packets, and multiple receivers. But in actual usage, there should be only

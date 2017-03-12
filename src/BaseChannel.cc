@@ -5,7 +5,7 @@
 namespace net_stack {
 
 BaseChannel::BaseChannel(ReceiverCallBack receiver_callback) :
-    receiver_callback_(receiver_callback) {
+    receiver_callback_(std::move(receiver_callback)) {
 }
 
 BaseChannel::~BaseChannel() {
@@ -48,7 +48,7 @@ void BaseChannel::Send(Packet* packet) {
 
 void BaseChannel::RegisterReceiverCallback(ReceiverCallBack receiver_callback) {
   std::unique_lock<std::mutex> lock(cb_mutex_);
-  receiver_callback_ = receiver_callback;
+  receiver_callback_ = std::move(receiver_callback);
 }
 
 void BaseChannel::WaitingForPackets() {

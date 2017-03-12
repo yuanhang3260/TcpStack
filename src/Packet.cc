@@ -5,12 +5,12 @@
 
 namespace net_stack {
 
-Packet::Packet(const IPHeader& ip_header, const TCPHeader& tcp_header) :
+Packet::Packet(const IPHeader& ip_header, const TcpHeader& tcp_header) :
     ip_header_(ip_header),
     tcp_header_(tcp_header) {
 }
 
-Packet::Packet(const IPHeader& ip_header, const TCPHeader& tcp_header,
+Packet::Packet(const IPHeader& ip_header, const TcpHeader& tcp_header,
                const std::string& data) :
     ip_header_(ip_header),
     tcp_header_(tcp_header) {
@@ -19,7 +19,7 @@ Packet::Packet(const IPHeader& ip_header, const TCPHeader& tcp_header,
 }
 
 // It does NOT take ownership of the payload buffer.
-Packet::Packet(const IPHeader& ip_header, const TCPHeader& tcp_header,
+Packet::Packet(const IPHeader& ip_header, const TcpHeader& tcp_header,
                const char* data, int size) :
     ip_header_(ip_header),
     tcp_header_(tcp_header) {
