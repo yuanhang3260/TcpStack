@@ -3,6 +3,7 @@
 
 #include <string>
 
+#include "Base/BaseTypes.h"
 #include "IPHeader.h"
 #include "TcpHeader.h"
 
@@ -26,7 +27,7 @@ class Packet {
   const IPHeader& ip_header() { return ip_header_; }
   const TcpHeader& tcp_header() { return tcp_header_; }
   const char* payload() { return payload_; }
-  int payload_size() { return payload_size_; }
+  uint32 payload_size() { return payload_size_; }
 
   void InjectPayload(const char* payload, int size);
 
@@ -34,7 +35,7 @@ class Packet {
   IPHeader ip_header_;
   TcpHeader tcp_header_;
   char* payload_ = nullptr;
-  int payload_size_ = 0;
+  uint32 payload_size_ = 0;
 };
 
 }  // namespace net_stack

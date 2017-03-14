@@ -16,6 +16,7 @@ Packet::Packet(const IPHeader& ip_header, const TcpHeader& tcp_header,
     tcp_header_(tcp_header) {
   payload_ = new char[data.size()];
   memcpy(payload_, data.c_str(), data.size());
+  payload_size_ = data.size();
 }
 
 // It does NOT take ownership of the payload buffer.
@@ -38,6 +39,7 @@ void Packet::InjectPayload(const char* data, int size) {
   }
   payload_ = new char[size];
   memcpy(payload_, data, size);
+  payload_size_ = size;
 }
 
 }  // namespace net_stack

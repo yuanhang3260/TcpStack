@@ -9,7 +9,7 @@
 
 namespace net_stack {
 
-// This class wrapps a queue of Packet.
+// This class wrapps a queue of Packet. This class is not thread-safe.
 class PacketQueue {
  public:
   PacketQueue() = default;
@@ -23,7 +23,7 @@ class PacketQueue {
   bool empty() const;
 
  private:
-  std::queue< std::unique_ptr<Packet> > packets_;
+  std::queue<std::unique_ptr<Packet>> packets_;
 };
 
 }  // namespace net_stack

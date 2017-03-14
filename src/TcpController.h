@@ -55,9 +55,9 @@ class TcpController {
   TcpControllerKey key_;
 
   // Packet receive buffer of this single TCP connection.
-  PacketQueue rcv_buffer_;
-  std::mutex rcv_buffer_mutex_;
-  std::condition_variable rcv_buffer_cv_;
+  PacketQueue recv_buffer_;
+  std::mutex recv_buffer_mutex_;
+  std::condition_variable recv_buffer_cv_;
 
   Executors::FixedThreadPool* thread_pool_;
 };

@@ -27,9 +27,9 @@ class Host {
   std::string ip_address_;  // human readable IP address (aa.bb.cc.dd)
 
   // Receive packets buffer.
-  PacketQueue rcv_buffer_;
-  std::mutex rcv_buffer_mutex_;
-  std::condition_variable rcv_buffer_cv_;
+  PacketQueue recv_buffer_;
+  std::mutex recv_buffer_mutex_;
+  std::condition_variable recv_buffer_cv_;
 
   // Send packets buffer.
   PacketQueue send_buffer_;
