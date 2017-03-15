@@ -53,7 +53,7 @@ void BaseChannel::RegisterReceiverCallback(ReceiverCallBack receiver_callback) {
 
 void BaseChannel::WaitingForPackets() {
   while (1) {
-    std::queue<std::unique_ptr<Packet>> new_packets_;
+    std::queue<std::unique_ptr<Packet>> new_packets;
     {
       std::unique_lock<std::mutex> lock(pkt_buffer_mutex_);
       pkt_buffer_cv_.wait(lock,
@@ -61,13 +61,13 @@ void BaseChannel::WaitingForPackets() {
       if (stop_) {
         break;
       }
-      pkt_buffer_.DeQueueAllTo(&new_packets_);
+      pkt_buffer_.DeQueueAllTo(&new_packets);
     }
 
     {
       std::unique_lock<std::mutex> lock(cb_mutex_);
       if (receiver_callback_) {
-        receiver_callback_(new_packets_);
+        receiver_callback_(new_packets);
       }
     }
   }

@@ -11,7 +11,9 @@
 
 #include "BaseChannel.h"
 #include "PacketQueue.h"
-#include "TcpController.h"
+#include "RecvWindow.h"
+#include "SendWindow.h"
+#include "Utility/RingBuffer.h"
 #include "Utility/ThreadPool.h"
 
 namespace net_stack {
@@ -46,20 +48,56 @@ struct TcpControllerKey {
   }
 };
 
+class Host;
+
+struct TcpControllerOptions {
+  TcpControllerKey key;
+
+  uint32 send_buffer_size = 0;
+  uint32 send_window_base = 0;
+  uint32 send_window_size = 0;
+
+  uint32 recv_buffer_size = 0;
+  uint32 recv_window_base = 0;
+  uint32 recv_window_size = 0;
+};
+
+// TcpController is completely event-driven. It has monitors for all 
 class TcpController {
  public:
-  TcpController(const TcpControllerKey& key,
-                Executors::FixedThreadPool* thread_pool);
+  TcpController(Host* host, const TcpControllerOptions& options);
+
+  static TcpControllerOptions GetDefaultOptions();
+
+  // Host delivers new packet to this TCP connection.
+  void ReceiveNewPacket(std::unique_ptr<Packet> packet);
 
  private:
+  void PacketReceiveBufferListner();
+  void HandleReceivedPackets(std::queue<std::unique_ptr<Packet>>* new_packets);
+
+  Host* host_ = nullptr;
+  Executors::FixedThreadPool thread_pool_;
+
   TcpControllerKey key_;
 
-  // Packet receive buffer of this single TCP connection.
-  PacketQueue recv_buffer_;
+  // Socket send buffer.
+  Utility::RingBuffer send_buffer_;
+  // Send window.
+  SendWindow send_window_;
+
+  // Socket receive buffer.
+  Utility::RingBuffer recv_buffer_;
   std::mutex recv_buffer_mutex_;
   std::condition_variable recv_buffer_cv_;
+  // Recv window.
+  RecvWindow recv_window_;
 
-  Executors::FixedThreadPool* thread_pool_;
+  // Packet receive buffer. This is the low-level queue to buffer received
+  // packets delivered from host (namely layer 2).
+  PacketQueue pkt_recv_buffer_;
+  std::mutex pkt_recv_buffer_mutex_;
+  std::condition_variable pkt_recv_buffer_cv_;
 };
 
 }  // namespace net_stack
