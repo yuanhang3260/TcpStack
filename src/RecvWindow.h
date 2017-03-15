@@ -10,7 +10,6 @@
 
 namespace net_stack {
 
-// Base class of SendWindow and RecvWindow.
 class RecvWindow : public TcpWindow {
  public:
   // Receive window is a doubly-linked list, because it needs to handle out of

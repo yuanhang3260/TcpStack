@@ -21,7 +21,37 @@ class RecvWindowTest: public UnitTest {
       AssertEqual(1, PacketChainSize(result.second));
     }
   }
-  
+
+  void TestReceiveOutOfOrder() {
+    auto result = recv_window_.ReceivePacket(MakePacket(0, "hello"));
+    AssertEqual(5, result.first);
+    AssertEqual(1, PacketChainSize(result.second));
+
+    result = recv_window_.ReceivePacket(MakePacket(10, "hello"));
+    AssertEqual(5, result.first);
+    AssertEqual(0, PacketChainSize(result.second));
+
+    result = recv_window_.ReceivePacket(MakePacket(15, "hello"));
+    AssertEqual(5, result.first);
+    AssertEqual(0, PacketChainSize(result.second));
+
+    result = recv_window_.ReceivePacket(MakePacket(25, "hello"));
+    AssertEqual(5, result.first);
+    AssertEqual(0, PacketChainSize(result.second));
+
+    result = recv_window_.ReceivePacket(MakePacket(5, "hello"));
+    AssertEqual(20, result.first);
+    AssertEqual(3, PacketChainSize(result.second));
+
+    result = recv_window_.ReceivePacket(MakePacket(30, "hello"));
+    AssertEqual(20, result.first);
+    AssertEqual(0, PacketChainSize(result.second));
+
+    result = recv_window_.ReceivePacket(MakePacket(20, "hello"));
+    AssertEqual(35, result.first);
+    AssertEqual(3, PacketChainSize(result.second));
+  }
+
  protected:
   std::unique_ptr<Packet> MakePacket(uint32 tcp_seq_num,
                                      const std::string& data) {
@@ -33,6 +63,11 @@ class RecvWindowTest: public UnitTest {
   }
 
   uint32 PacketChainSize(std::shared_ptr<RecvWindow::RecvWindowNode> node) {
+    if (!node) {
+      return 0;
+    }
+
+    AssertTrue(!node->prev);
     uint32 size = 0;
     while (node) {
       size++;
@@ -49,7 +84,8 @@ class RecvWindowTest: public UnitTest {
 int main() {
   net_stack::RecvWindowTest test;
   test.setup();
-  test.TestReceiveOrderly();
+  // test.TestReceiveOrderly();
+  test.TestReceiveOutOfOrder();
   test.teardown();
 
   std::cout << "\033[2;32mPassed ^_^\033[0m" << std::endl;

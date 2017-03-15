@@ -42,4 +42,10 @@ void Packet::InjectPayload(const char* data, int size) {
   payload_size_ = size;
 }
 
+Packet* Packet::Copy() const {
+  Packet* copy = new Packet(ip_header_, tcp_header_);
+  copy->InjectPayload(payload_, payload_size_);
+  return copy;
+}
+
 }  // namespace net_stack

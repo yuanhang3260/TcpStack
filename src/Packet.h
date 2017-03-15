@@ -24,6 +24,8 @@ class Packet {
 
   ~Packet();
 
+  Packet* Copy() const;
+
   const IPHeader& ip_header() { return ip_header_; }
   const TcpHeader& tcp_header() { return tcp_header_; }
   const char* payload() { return payload_; }

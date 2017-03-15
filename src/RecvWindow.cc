@@ -39,10 +39,11 @@ RecvWindow::ReceivePacket(std::unique_ptr<Packet> new_pkt) {
   if (new_node->next) {
     new_node->next->prev = new_node;
     SANITY_CHECK(
-        new_pkt_seq +  new_pkt_length < new_node->next->pkt->payload_size(),
+        new_pkt_seq +  new_pkt_length <=
+            new_node->next->pkt->tcp_header().seq_num,
         "Packet size ranges overlap");
   }
-  new_node->prev = head_;
+  new_node->prev = node;
   node->next = new_node;
 
   // If new packet's seq number is expected as recv_base, update recv_base,
@@ -51,11 +52,9 @@ RecvWindow::ReceivePacket(std::unique_ptr<Packet> new_pkt) {
     SANITY_CHECK(new_node == head_->next,
                  "new node is in-order, must have been inserted to queue head");
     std::shared_ptr<RecvWindowNode> node = new_node;
-    uint32 crt_pkt_seq = node->pkt->tcp_header().seq_num;
-    uint32 crt_pkt_length = node->pkt->payload_size();
     while (node && node->next) {
-      crt_pkt_seq = node->pkt->tcp_header().seq_num;
-      crt_pkt_length = node->pkt->payload_size();
+      uint32 crt_pkt_seq = node->pkt->tcp_header().seq_num;
+      uint32 crt_pkt_length = node->pkt->payload_size();
       uint32 next_pkt_seq = node->next->pkt->tcp_header().seq_num;
       if (crt_pkt_seq + crt_pkt_length == next_pkt_seq) {  // overflow is fine
         node = node->next;
@@ -67,13 +66,15 @@ RecvWindow::ReceivePacket(std::unique_ptr<Packet> new_pkt) {
     if (node->next) {
       node->next->prev = head_;
     }
-    recv_base_ = crt_pkt_seq + crt_pkt_length;
+    new_node->prev = nullptr;
+    node->next = nullptr;
+    recv_base_ = node->pkt->tcp_header().seq_num + node->pkt->payload_size();
     return std::make_pair(recv_base_, new_node);
   }
   else {
-    // It's an out of order packet. Insert it to the proper place.
+    // It's an out-of-order packet. Re-ack recv_base.
     return std::make_pair(recv_base_, nullptr);
   }
 }
 
-}
+}  // namespace net_stack

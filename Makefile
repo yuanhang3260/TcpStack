@@ -21,6 +21,7 @@ OBJ = $(OBJ_DIR)/BaseChannel.o \
       $(OBJ_DIR)/Packet.o \
       $(OBJ_DIR)/PacketQueue.o \
       $(OBJ_DIR)/RecvWindow.o \
+      $(OBJ_DIR)/SendWindow.o \
       $(OBJ_DIR)/TcpHeader.o \
       $(OBJ_DIR)/TcpController.o \
       $(OBJ_DIR)/TcpWindow.o \
@@ -28,14 +29,16 @@ OBJ = $(OBJ_DIR)/BaseChannel.o \
 TESTOBJ = $(OBJ_DIR)/PacketQueue_test.o \
           $(OBJ_DIR)/BaseChannel_test.o \
           $(OBJ_DIR)/RecvWindow_test.o \
+          $(OBJ_DIR)/SendWindow_test.o \
 
 TESTEXE = test/PacketQueue_test.out \
           test/BaseChannel_test.out \
           test/RecvWindow_test.out \
+          test/SendWindow_test.out \
 
 all: libhy library
 
-test: $(TESTEXE)
+test: library $(TESTEXE)
 
 libhy:
 	+$(MAKE) -C $(HYLIB_DIR)
