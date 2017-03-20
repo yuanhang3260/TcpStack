@@ -53,15 +53,15 @@ bool SendWindow::NewAckedPacket(uint32 ack_num) {
   // Do a sanity check : Is the ack_num within send window?
   if (send_base_ < send_base_ + capacity_ &&
       (ack_num < send_base_ || ack_num > send_base_ + capacity_)) {
-    LogFATAL("ack_num %d out of window [%d, %d)",
+    LogERROR("ack_num %d out of window [%d, %d)",
              ack_num, send_base_, send_base_ + capacity_);
-    return true;
+    return false;
   }
   if (send_base_ >= send_base_ + capacity_ &&
       (ack_num < send_base_ && ack_num > send_base_ + capacity_)) {
-    LogFATAL("ack_num %d out of overflow window [%d, %d)",
+    LogERROR("ack_num %d out of overflow window [%d, %d)",
              ack_num, send_base_, send_base_ + capacity_);
-    return true;
+    return false;
   }
 
   // Be careful of ack num overflow.
@@ -94,17 +94,29 @@ bool SendWindow::NewAckedPacket(uint32 ack_num) {
     send_base_ = ack_num;
     last_acked_num_ = ack_num;
     duplicated_acks_ = 0;
-    return true;
+    return false;
   } else if (ack_num == send_base_) {
     duplicated_acks_++;
     if (duplicated_acks_ >= kMaxDuplicatedAcks) {
       duplicated_acks_ = 0;
-      return false;
+      return true;
     }
-    return true;
+    return false;
   } else {
-    return true;
+    return false;
   }
+}
+
+std::unique_ptr<Packet> SendWindow::BasePakcketWaitingForAck() const {
+  std::unique_ptr<Packet> pkt;
+  if (!pkts_to_ack_.empty()) {
+    pkt.reset(pkts_to_ack_.front()->Copy());
+  }
+  return pkt;
+}
+
+uint32 SendWindow::NextSeqNumberToSend() const {
+  return send_base_ + size_;
 }
 
 }  // namespace net_stack

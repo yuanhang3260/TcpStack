@@ -21,7 +21,7 @@ Packet::Packet(const IPHeader& ip_header, const TcpHeader& tcp_header,
 
 // It does NOT take ownership of the payload buffer.
 Packet::Packet(const IPHeader& ip_header, const TcpHeader& tcp_header,
-               const char* data, int size) :
+               const byte* data, int size) :
     ip_header_(ip_header),
     tcp_header_(tcp_header) {
   InjectPayload(data, size);
@@ -33,13 +33,20 @@ Packet::~Packet() {
   }
 }
 
-void Packet::InjectPayload(const char* data, int size) {
+uint32 Packet::InjectPayload(const byte* data, int size) {
   if (payload_) {
     delete[] payload_;
   }
-  payload_ = new char[size];
+  payload_ = new byte[size];
   memcpy(payload_, data, size);
   payload_size_ = size;
+  return size;
+}
+
+uint32 Packet::InjectPayloadFromBuffer(
+    BufferInterface* src_buffer, uint32 size) {
+  payload_size_ = src_buffer.Read(payload_, size);
+  return payload_size_;
 }
 
 Packet* Packet::Copy() const {

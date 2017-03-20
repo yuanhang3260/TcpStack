@@ -13,7 +13,7 @@
 #include "PacketQueue.h"
 #include "RecvWindow.h"
 #include "SendWindow.h"
-#include "Utility/RingBuffer.h"
+#include "Utility/InfiniteBuffer.h"
 #include "Utility/ThreadPool.h"
 
 namespace net_stack {
@@ -72,9 +72,19 @@ class TcpController {
   // Host delivers new packet to this TCP connection.
   void ReceiveNewPacket(std::unique_ptr<Packet> packet);
 
+  // This is the actual streaming API for application layer to call. 
+  int32 ReadData(byte* buf, int32 size);
+
  private:
+  // These methods serve uplink packet/data delivery (receive data).
   void PacketReceiveBufferListner();
   void HandleReceivedPackets(std::queue<std::unique_ptr<Packet>>* new_packets);
+  std::unique_ptr<Packet> MakeAckPacket(uint32 ack_num);
+  void StreamDataToReceiveBuffer(
+      std::shared_ptr<RecvWindow::RecvWindowNode> received_pkt_nodes);
+
+  // These method serve down-link packet/data delivery (send data).
+  void SocketSendBufferListener();
 
   Host* host_ = nullptr;
   Executors::FixedThreadPool thread_pool_;
@@ -82,12 +92,14 @@ class TcpController {
   TcpControllerKey key_;
 
   // Socket send buffer.
-  Utility::RingBuffer send_buffer_;
+  Utility::InfiniteBuffer send_buffer_;
+  std::mutex send_buffer_mutex_;
+  std::condition_variable send_buffer_cv_;
   // Send window.
   SendWindow send_window_;
 
   // Socket receive buffer.
-  Utility::RingBuffer recv_buffer_;
+  Utility::InfiniteBuffer recv_buffer_;
   std::mutex recv_buffer_mutex_;
   std::condition_variable recv_buffer_cv_;
   // Recv window.

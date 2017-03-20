@@ -20,7 +20,7 @@ class SendWindow : public TcpWindow {
   bool SendPacket(std::shared_ptr<Packet> pkt);
 
   // Get a newly acked packet. Check if we can move forward send base.
-  // Return value false indicates overly duplicated ACKs, and we need do a fast
+  // Return value true indicates overly duplicated ACKs, and we need do a fast
   // re-transmit.
   bool NewAckedPacket(uint32 ack_num);
 
@@ -30,6 +30,10 @@ class SendWindow : public TcpWindow {
   uint32 send_base() const { return send_base_; }
 
   uint32 NumPacketsToAck() const { return pkts_to_ack_.size(); }
+
+  uint32 NextSeqNumberToSend() const;
+
+  std::unique_ptr<Packet> BasePakcketWaitingForAck() const;
 
   void Reset();
 
@@ -43,6 +47,8 @@ class SendWindow : public TcpWindow {
   // Currently used space.
   uint32 size_ = 0;
 
+  // We use shared_ptr to save pakcets waiting for ack, to indicate they're not
+  // "movable", because we may need re-transmission.
   std::queue<std::shared_ptr<Packet>> pkts_to_ack_;
 
   uint32 last_acked_num_ = 0;
