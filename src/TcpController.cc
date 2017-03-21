@@ -1,3 +1,5 @@
+#include <chrono>
+
 #include "Base/Log.h"
 #include "Base/MacroUtils.h"
 #include "Base/Utils.h"
@@ -17,7 +19,9 @@ TcpController::TcpController(Host* host, const TcpControllerOptions& options) :
     send_buffer_(options.send_buffer_size),
     send_window_(options.send_window_base, options.send_window_size),
     recv_buffer_(options.recv_buffer_size),
-    recv_window_(options.recv_window_base, options.recv_window_size) {
+    recv_window_(options.recv_window_base, options.recv_window_size),
+    timer_(std::chrono::duration_cast<std::chrono::seconds>(1),
+           std::bind(&TcpController::TimeoutReTransmitter, this)) {
 }
 
 // This method just enqueue the new packet into this TCP connection's private
@@ -53,6 +57,8 @@ void TcpController::HandleReceivedPackets(
     new_packets->pop();
 
     if (pkt->tcp_header().ack) {
+      std::unique_lock<std::mutex> lock(send_window_mutex_);
+
       // Handle ack packet. If detect duplicated ACKs, do a fast re-transmit.
       bool re_transmit = send_window_.NewAckedPacket(pkt->tcp_header().ack_num);
       if (re_transmit) {
@@ -66,15 +72,6 @@ void TcpController::HandleReceivedPackets(
       StreamDataToReceiveBuffer(pair.second);
     }
   }
-}
-
-std::unique_ptr<Packet> TcpController::MakeAckPacket(uint32 ack_num) {
-  IPHeader ip_header;
-  TcpHeader tcp_header;
-  tcp_header.ack = true;
-  tcp_header.ack_num = ack_num;
-  std::unique_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
-  return pkt;
 }
 
 void TcpController::StreamDataToReceiveBuffer(
@@ -93,41 +90,82 @@ void TcpController::StreamDataToReceiveBuffer(
 // TODO: add support for non-blocking read.
 int32 TcpController::ReadData(byte* buf, int32 size) {
   std::unique_lock<std::mutex> lock(recv_buffer_mutex_);
-  pkt_recv_buffer_cv_.wait(lock,
+  recv_buffer_cv_.wait(lock,
       [this] { return !recv_buffer_.empty(); });
 
   // Copy data to user buffer.
+  // TODO: replace with RingBuffer to check flow control.
   uint32 readn = recv_buffer_.Read(buf, size);
 
   // Cast should be safe. We'll never have a receive buffer as big as 2^31
-  return static_cast<int32>readn;
+  return static_cast<int32>(readn);
+}
+
+int32 TcpController::WriteData(const byte* buf, int32 size) {
+  uint32 writen = 0;
+  {
+    std::unique_lock<std::mutex> lock(send_buffer_mutex_);
+    // Non-blocking mode?
+    writen = send_buffer_.Write(buf, size);
+  }
+
+  send_buffer_cv_.notify_one();
+  return static_cast<int32>(writen);
 }
 
 void TcpController::SocketSendBufferListener() {
+  while (true) {
+    std::unique_lock<std::mutex> lock(send_buffer_mutex_);
+    send_buffer_cv_.wait(lock,
+        [this] { return !send_buffer_.empty(); });
+
+    // Create data packets and send them out.
+    uint32 size_to_send =
+        Utils::Min(send_window_.free_space(), send_buffer_.size());
+    uint32 num_pkts = size_to_send / kDefaultDataPacketSize;
+    uint32 last_pkt_size = size_to_send % kDefaultDataPacketSize;
+    for (uint32 i = 0; i < num_pkts; i++) {
+      auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
+                                         send_buffer_, kDefaultDataPacketSize);
+      // This just mark the new pkt into send window.
+      send_window_.SendPacket(new_data_pkt);
+      // Really send the packet.
+      SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
+    }
+
+    if (last_pkt_size > 0) {
+      auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
+                                         send_buffer_, last_pkt_size);
+      send_window_.SendPacket(new_data_pkt);
+      SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
+    }
+  }
+}
+
+void  TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
+  {
+    std::unique_lock<std::mutex> lock(pkt_send_buffer_mutext_);
+    pkt_send_buffer_.Push(std::move(pkt));
+  }
+  pkt_send_buffer_cv.notify_one();
+}
+
+void TcpController::PacketSendBufferListner() {
+  while (true) {
+    std::unique_lock<std::mutex> lock(pkt_send_buffer_mutext_);
+    pkt_send_buffer_cv.wait(lock,
+        [this] { return !pkt_send_buffer_.empty(); });
+
+    // Deliver packets to host buffer.
+    //host->GetPacketsFromLocalTcp(pkt_send_buffer_);
+  }
+}
+
+void TcpController::TimeoutReTransmitter() {
+  // Current timer expired. Re-transmit the oldest packet in send window. Note
+  // timer will be automatically restarted.
   std::unique_lock<std::mutex> lock(send_buffer_mutex_);
-  send_buffer_cv_.wait(lock,
-      [this] { return !send_buffer_.empty(); });
-
-  // Create data packets and send them out.
-  uint32 size_to_send =
-      Utils::Min(send_window_.free_space(), send_buffer_.size());
-  uint32 num_pkts = size_to_send / kDefaultDataPacketSize;
-  uint32 last_pkt_size = size_to_send % kDefaultDataPacketSize;
-  for (uint32 i = 0; i < num_pkts; i++) {
-    auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
-                                       send_buffer_, kDefaultDataPacketSize);
-    // This just mark the new pkt into send window.
-    send_window_.SendPacket(new_data_pkt);
-    // Really send the packet.
-    SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
-  }
-
-  if (last_pkt_size > 0) {
-    auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
-                                       send_buffer_, last_pkt_size);
-    send_window_.SendPacket(new_data_pkt);
-    SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
-  }
+  SendPacket(send_window_.BasePakcketWaitingForAck());
 }
 
 std::shared_ptr<Packet> TcpController::MakeDataPacket(
@@ -146,6 +184,15 @@ std::shared_ptr<Packet> TcpController::MakeDataPacket(
   tcp_header.ack = false;
   std::shared_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
   pkt.InjectPayloadFromBuffer(data_buffer, size);
+  return pkt;
+}
+
+std::unique_ptr<Packet> TcpController::MakeAckPacket(uint32 ack_num) {
+  IPHeader ip_header;
+  TcpHeader tcp_header;
+  tcp_header.ack = true;
+  tcp_header.ack_num = ack_num;
+  std::unique_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
   return pkt;
 }
 
