@@ -9,7 +9,7 @@ namespace net_stack {
 
 namespace {
 uint32 kThreadPoolSize = 6;
-uint32 kDefaultDataPacketSize = 1500;
+uint32 kDefaultDataPacketSize = 1000;
 }
 
 TcpController::TcpController(Host* host, const TcpControllerOptions& options) :
@@ -57,12 +57,21 @@ void TcpController::HandleReceivedPackets(
     new_packets->pop();
 
     if (pkt->tcp_header().ack) {
-      std::unique_lock<std::mutex> lock(send_window_mutex_);
+      std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
 
       // Handle ack packet. If detect duplicated ACKs, do a fast re-transmit.
       bool re_transmit = send_window_.NewAckedPacket(pkt->tcp_header().ack_num);
       if (re_transmit) {
         SendPacket(send_window_.BasePakcketWaitingForAck());
+      }
+      // If send window is cleared, stop the timer.
+      if (send_window_.NumPacketsToAck() == 0) {
+        timer_.Stop();
+      }
+
+      // If send window has free space, notify packet send thread.
+      if (send_window_.free_space() > 0) {
+        send_window_cv_.notify_one();
       }
     } else {
       // Handle data packet. It sends a ack packet back to sender, and deliver
@@ -115,9 +124,24 @@ int32 TcpController::WriteData(const byte* buf, int32 size) {
 
 void TcpController::SocketSendBufferListener() {
   while (true) {
-    std::unique_lock<std::mutex> lock(send_buffer_mutex_);
-    send_buffer_cv_.wait(lock,
+    // Wait for send window to be not full.
+    std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
+    send_window_cv_.wait(lock_send_window,
+        [this] { return !send_window_.free_space() > 0; });
+    lock_send_window.unlock();
+
+    // Wait for socket send buffer to have data.
+    std::unique_lock<std::mutex> lock_send_buffer(send_buffer_mutex_);
+    send_buffer_cv_.wait(lock_send_buffer,
         [this] { return !send_buffer_.empty(); });
+
+    // Lock send window again. We're sure it has free space now, because it
+    // has passed the previous conditional wait.
+    lock_send_window.lock();
+    if (send_window_.free_space() <= 0) {
+      LOG(ERROR) << "This should NOT happen. Send window must have space".
+      continue;
+    }
 
     // Create data packets and send them out.
     uint32 size_to_send =
@@ -125,26 +149,35 @@ void TcpController::SocketSendBufferListener() {
     uint32 num_pkts = size_to_send / kDefaultDataPacketSize;
     uint32 last_pkt_size = size_to_send % kDefaultDataPacketSize;
     for (uint32 i = 0; i < num_pkts; i++) {
+      bool restart_timer = (send_window_.NumPacketsToAck() == 0);
+
       auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
                                          send_buffer_, kDefaultDataPacketSize);
       // This just mark the new pkt into send window.
       send_window_.SendPacket(new_data_pkt);
       // Really send the packet.
       SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
+      if (restart_timer) {
+        timer_.Restart();
+      }
     }
 
     if (last_pkt_size > 0) {
+      bool restart_timer = (send_window_.size() == 0);
       auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
                                          send_buffer_, last_pkt_size);
       send_window_.SendPacket(new_data_pkt);
       SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
+      if (restart_timer) {
+        timer_.Restart();
+      }
     }
   }
 }
 
-void  TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
+void TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
   {
-    std::unique_lock<std::mutex> lock(pkt_send_buffer_mutext_);
+    std::unique_lock<std::mutex> lock(pkt_send_buffer_mutex_);
     pkt_send_buffer_.Push(std::move(pkt));
   }
   pkt_send_buffer_cv.notify_one();
@@ -152,7 +185,7 @@ void  TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
 
 void TcpController::PacketSendBufferListner() {
   while (true) {
-    std::unique_lock<std::mutex> lock(pkt_send_buffer_mutext_);
+    std::unique_lock<std::mutex> lock(pkt_send_buffer_mutex_);
     pkt_send_buffer_cv.wait(lock,
         [this] { return !pkt_send_buffer_.empty(); });
 
@@ -164,8 +197,10 @@ void TcpController::PacketSendBufferListner() {
 void TcpController::TimeoutReTransmitter() {
   // Current timer expired. Re-transmit the oldest packet in send window. Note
   // timer will be automatically restarted.
-  std::unique_lock<std::mutex> lock(send_buffer_mutex_);
-  SendPacket(send_window_.BasePakcketWaitingForAck());
+  std::unique_lock<std::mutex> lock(send_window_mutex_);
+  if (send_window_.NumPacketsToAck() > 0) {
+    SendPacket(send_window_.BasePakcketWaitingForAck());
+  }
 }
 
 std::shared_ptr<Packet> TcpController::MakeDataPacket(
