@@ -16,11 +16,11 @@ TcpController::TcpController(Host* host, const TcpControllerOptions& options) :
     host_(host),
     thread_pool_(kThreadPoolSize),
     key_(options.key),
+    recv_window_(options.recv_window_base, options.recv_window_size),
+    recv_buffer_(options.recv_buffer_size),
     send_buffer_(options.send_buffer_size),
     send_window_(options.send_window_base, options.send_window_size),
-    recv_buffer_(options.recv_buffer_size),
-    recv_window_(options.recv_window_base, options.recv_window_size),
-    timer_(std::chrono::duration_cast<std::chrono::seconds>(1),
+    timer_(std::chrono::seconds(1),
            std::bind(&TcpController::TimeoutReTransmitter, this)) {
 }
 
@@ -28,8 +28,11 @@ TcpController::TcpController(Host* host, const TcpControllerOptions& options) :
 // packet receive buffer. It is PacketReceiveBufferListner that monitors this
 // queue and handles packets.
 void TcpController::ReceiveNewPacket(std::unique_ptr<Packet> packet) {
-  std::unique_lock<std::mutex> lock(pkt_recv_buffer_mutex_);
-  pkt_recv_buffer_.Push(std::move(packet));
+  {
+    std::unique_lock<std::mutex> lock(pkt_recv_buffer_mutex_);
+    pkt_recv_buffer_.Push(std::move(packet));
+  }
+  pkt_recv_buffer_cv_.notify_one();
 }
 
 void TcpController::PacketReceiveBufferListner() {
@@ -76,8 +79,8 @@ void TcpController::HandleReceivedPackets(
     } else {
       // Handle data packet. It sends a ack packet back to sender, and deliver
       // packets to upper layer (socket receive buffer) if avaible.
-      auto pair = recv_window_.ReceivePacket(pkt);
-      SendPacket(MakeAckPacket(pair.first));
+      auto pair = recv_window_.ReceivePacket(std::move(pkt));
+      SendPacket(std::move(MakeAckPacket(pair.first)));
       StreamDataToReceiveBuffer(pair.second);
     }
   }
@@ -87,9 +90,14 @@ void TcpController::StreamDataToReceiveBuffer(
     std::shared_ptr<RecvWindow::RecvWindowNode> received_pkt_nodes) {
   {
     std::unique_lock<std::mutex> lock(recv_buffer_mutex_);
-    std::shared_ptr<RecvWindowNode> node = received_pkt_nodes;
+    std::shared_ptr<RecvWindow::RecvWindowNode> node = received_pkt_nodes;
     while (node) {
-      recv_buffer_.Write(node->pkt->paylaod(), node->pkt->paylaod_size());
+      uint32 writen =
+          recv_buffer_.Write(node->pkt->payload(), node->pkt->payload_size());
+      if (writen <= 0) {
+        LogERROR("Socket receive buffer is full, pkt seq = %u is dropped.",
+                 node->pkt->tcp_header().seq_num);
+      }
       node = node->next;
     }
   }
@@ -115,6 +123,8 @@ int32 TcpController::WriteData(const byte* buf, int32 size) {
   {
     std::unique_lock<std::mutex> lock(send_buffer_mutex_);
     // Non-blocking mode?
+    send_buffer_write_cv_.wait(lock,
+        [this] { return !send_buffer_.full(); });
     writen = send_buffer_.Write(buf, size);
   }
 
@@ -130,7 +140,7 @@ void TcpController::SocketSendBufferListener() {
         [this] { return !send_window_.free_space() > 0; });
     lock_send_window.unlock();
 
-    // Wait for socket send buffer to have data.
+    // Wait for socket send buffer to have data to send.
     std::unique_lock<std::mutex> lock_send_buffer(send_buffer_mutex_);
     send_buffer_cv_.wait(lock_send_buffer,
         [this] { return !send_buffer_.empty(); });
@@ -139,7 +149,7 @@ void TcpController::SocketSendBufferListener() {
     // has passed the previous conditional wait.
     lock_send_window.lock();
     if (send_window_.free_space() <= 0) {
-      LOG(ERROR) << "This should NOT happen. Send window must have space".
+      LogERROR("This should NOT happen. Send window must have space");
       continue;
     }
 
@@ -152,7 +162,7 @@ void TcpController::SocketSendBufferListener() {
       bool restart_timer = (send_window_.NumPacketsToAck() == 0);
 
       auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
-                                         send_buffer_, kDefaultDataPacketSize);
+                                         &send_buffer_, kDefaultDataPacketSize);
       // This just mark the new pkt into send window.
       send_window_.SendPacket(new_data_pkt);
       // Really send the packet.
@@ -165,13 +175,15 @@ void TcpController::SocketSendBufferListener() {
     if (last_pkt_size > 0) {
       bool restart_timer = (send_window_.size() == 0);
       auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
-                                         send_buffer_, last_pkt_size);
+                                         &send_buffer_, last_pkt_size);
       send_window_.SendPacket(new_data_pkt);
       SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
       if (restart_timer) {
         timer_.Restart();
       }
     }
+    // Notify new data can be written to send buffer from user space.
+    send_buffer_write_cv_.notify_one();
   }
 }
 
@@ -180,13 +192,13 @@ void TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
     std::unique_lock<std::mutex> lock(pkt_send_buffer_mutex_);
     pkt_send_buffer_.Push(std::move(pkt));
   }
-  pkt_send_buffer_cv.notify_one();
+  pkt_send_buffer_cv_.notify_one();
 }
 
 void TcpController::PacketSendBufferListner() {
   while (true) {
     std::unique_lock<std::mutex> lock(pkt_send_buffer_mutex_);
-    pkt_send_buffer_cv.wait(lock,
+    pkt_send_buffer_cv_.wait(lock,
         [this] { return !pkt_send_buffer_.empty(); });
 
     // Deliver packets to host buffer.
@@ -204,7 +216,7 @@ void TcpController::TimeoutReTransmitter() {
 }
 
 std::shared_ptr<Packet> TcpController::MakeDataPacket(
-    uint32 seq_num, const char* data, uint32 size) {
+    uint32 seq_num, const byte* data, uint32 size) {
   IPHeader ip_header;
   TcpHeader tcp_header;
   tcp_header.ack = false;
@@ -213,12 +225,12 @@ std::shared_ptr<Packet> TcpController::MakeDataPacket(
 }
 
 std::shared_ptr<Packet> TcpController::MakeDataPacket(
-    uint32 seq_num, BufferInterface* data_buffer, uint32 size) {
+    uint32 seq_num, Utility::BufferInterface* data_buffer, uint32 size) {
   IPHeader ip_header;
   TcpHeader tcp_header;
   tcp_header.ack = false;
   std::shared_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
-  pkt.InjectPayloadFromBuffer(data_buffer, size);
+  pkt->InjectPayloadFromBuffer(data_buffer, size);
   return pkt;
 }
 

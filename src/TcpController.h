@@ -81,7 +81,6 @@ class TcpController {
   // These methods serve uplink packet/data delivery (receive data).
   void PacketReceiveBufferListner();
   void HandleReceivedPackets(std::queue<std::unique_ptr<Packet>>* new_packets);
-  std::unique_ptr<Packet> MakeAckPacket(uint32 ack_num);
   void StreamDataToReceiveBuffer(
       std::shared_ptr<RecvWindow::RecvWindowNode> received_pkt_nodes);
 
@@ -94,9 +93,10 @@ class TcpController {
   void TimeoutReTransmitter();
 
   std::shared_ptr<Packet> MakeDataPacket(
-      uint32 seq_num, const char* data, uint32 size);
+      uint32 seq_num, const byte* data, uint32 size);
   std::shared_ptr<Packet> MakeDataPacket(
-    uint32 seq_num, BufferInterface* data_buffer, uint32 size);
+    uint32 seq_num, Utility::BufferInterface* data_buffer, uint32 size);
+  
   std::unique_ptr<Packet> MakeAckPacket(uint32 ack_num);
 
   Host* host_ = nullptr;
@@ -104,10 +104,26 @@ class TcpController {
 
   TcpControllerKey key_;
 
+  // ************** Receive Pipeline ************** //
+  // Packet receive buffer. This is the low-level queue to buffer received
+  // packets delivered from host (namely layer 2).
+  PacketQueue pkt_recv_buffer_;
+  std::mutex pkt_recv_buffer_mutex_;
+  std::condition_variable pkt_recv_buffer_cv_;
+  // Recv window. No mutex needed. Only PacketReceiveBufferListner thread
+  // use it.
+  RecvWindow recv_window_;
+  // Socket receive buffer.
+  Utility::InfiniteBuffer recv_buffer_;
+  std::mutex recv_buffer_mutex_;
+  std::condition_variable recv_buffer_cv_;
+
+  // *************** Send Pipeline **************** //
   // Socket send buffer.
   Utility::InfiniteBuffer send_buffer_;
   std::mutex send_buffer_mutex_;
   std::condition_variable send_buffer_cv_;
+  std::condition_variable send_buffer_write_cv_;
   // Send window.
   SendWindow send_window_;
   std::mutex send_window_mutex_;
@@ -117,20 +133,6 @@ class TcpController {
   PacketQueue pkt_send_buffer_;
   std::mutex pkt_send_buffer_mutex_;
   std::condition_variable pkt_send_buffer_cv_;
-
-  // Socket receive buffer.
-  Utility::InfiniteBuffer recv_buffer_;
-  std::mutex recv_buffer_mutex_;
-  std::condition_variable recv_buffer_cv_;
-  // Recv window.
-  RecvWindow recv_window_;
-  std::mutex recv_window_mutex_;
-  std::condition_variable recv_window_cv_;
-  // Packet receive buffer. This is the low-level queue to buffer received
-  // packets delivered from host (namely layer 2).
-  PacketQueue pkt_recv_buffer_;
-  std::mutex pkt_recv_buffer_mutex_;
-  std::condition_variable pkt_recv_buffer_cv_;
 
   // Timer
   Utility::Timer timer_;

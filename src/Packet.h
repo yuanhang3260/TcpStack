@@ -34,7 +34,8 @@ class Packet {
   uint32 payload_size() { return payload_size_; }
 
   uint32 InjectPayload(const byte* payload, int size);
-  uint32 InjectPayloadFromBuffer(BufferInterface* src_buffer, uint32 size);
+  uint32 InjectPayloadFromBuffer(Utility::BufferInterface* src_buffer,
+                                 uint32 size);
 
  private:
   IPHeader ip_header_;

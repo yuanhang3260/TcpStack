@@ -14,7 +14,7 @@ Packet::Packet(const IPHeader& ip_header, const TcpHeader& tcp_header,
                const std::string& data) :
     ip_header_(ip_header),
     tcp_header_(tcp_header) {
-  payload_ = new char[data.size()];
+  payload_ = new byte[data.size()];
   memcpy(payload_, data.c_str(), data.size());
   payload_size_ = data.size();
 }
@@ -44,8 +44,8 @@ uint32 Packet::InjectPayload(const byte* data, int size) {
 }
 
 uint32 Packet::InjectPayloadFromBuffer(
-    BufferInterface* src_buffer, uint32 size) {
-  payload_size_ = src_buffer.Read(payload_, size);
+    Utility::BufferInterface* src_buffer, uint32 size) {
+  payload_size_ = src_buffer->Read(payload_, size);
   return payload_size_;
 }
 

@@ -33,6 +33,8 @@ bool SendWindow::SendPacket(std::shared_ptr<Packet> new_pkt) {
   if (!pkts_to_ack_.empty()) {
     uint32 last_seq_num = pkts_to_ack_.back()->tcp_header().seq_num;
     uint32 last_pkt_length = pkts_to_ack_.back()->payload_size();
+    SANITY_CHECK(last_seq_num + last_pkt_length == send_base_ + size_,
+                 "last un-acked pkt mismatch with (send_base + size)");
     if (new_pkt->tcp_header().seq_num != last_seq_num + last_pkt_length) {
       LogERROR("Send queue has last packet %u size %u, "
                "expect to send next packet seq num = %d, "
