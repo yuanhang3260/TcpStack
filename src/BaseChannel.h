@@ -27,7 +27,7 @@ namespace net_stack {
 class BaseChannel {
  public:
   using ReceiverCallBack =
-      std::function<void(std::queue<std::unique_ptr<Packet>>&)>;
+      std::function<void(std::queue<std::unique_ptr<Packet>>*)>;
 
   BaseChannel() = default;
   explicit BaseChannel(ReceiverCallBack receiver_callback);
@@ -39,6 +39,7 @@ class BaseChannel {
   // rather than channel sending packets out to receiver, if you see code like
   // "channel.Send(pkt)".
   void Send(std::unique_ptr<Packet> packet);
+  void Send(std::queue<std::unique_ptr<Packet>>* pkts);
   // It takes ownership of the packet.
   void Send(Packet* packet);
 

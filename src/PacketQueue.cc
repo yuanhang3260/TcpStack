@@ -6,13 +6,22 @@ void PacketQueue::Push(std::unique_ptr<Packet> new_ele) {
   packets_.push(std::move(new_ele));
 }
 
+uint32 PacketQueue::Push(std::queue<std::unique_ptr<Packet>>* pkts) {
+  uint32 size = pkts->size();
+  for (uint32 i = 0; i < size; i++) {
+    packets_.push(std::move(pkts->front()));
+    pkts->pop();
+  }
+  return size;
+}
+
 std::unique_ptr<Packet> PacketQueue::DeQueue() {
   auto re = std::move(packets_.front());
   packets_.pop();
   return re;
 }
 
-int PacketQueue::DeQueueAllTo(
+uint32 PacketQueue::DeQueueAllTo(
     std::queue< std::unique_ptr<Packet> >* receiver_queue) {
   uint32 total_size = packets_.size();
   receiver_queue->swap(packets_);

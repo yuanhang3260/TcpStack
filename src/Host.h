@@ -19,30 +19,57 @@ namespace net_stack {
 
 class Host {
  public:
-  Host(const std::string& ip_address);
+  Host(const std::string& ip_address, BaseChannel* channel);
 
-  DEFINE_ACCESSOR(ip_address, std::string);
+  // This is the callback passed to channel. Channel use it to move packets
+  // to host's receive queue.
+  void MovePacketsFromChannel(std::queue<std::unique_ptr<Packet>>* new_pkts);
+
+  // This is called by each TCP connection to deliver packets to host's
+  // send queue.
+  void MultiplexPacketsFromTcp(
+      std::queue<std::unique_ptr<Packet>>* packets_to_send);
+
+  // TODO: Make this private.
+  void CreateTcpConnection(const std::string& source_ip, uint32 source_port,
+                           uint32 local_port, uint32 socket_fd);
+
+  // Read and write data with socket.
+  int32 ReadData(uint32 socket_fd, byte* buffer, int32 size);
+  int32 WriteData(uint32 socket_fd, const byte* buffer, int32 size);
+
+  std::string ip_address() const { return ip_address_; }
 
  private:
-  std::string ip_address_;  // human readable IP address (aa.bb.cc.dd)
+  void PacketsReceiveListener();
+  void DemultiplexPacketsToTcps(
+      std::queue<std::unique_ptr<Packet>>* new_packets);
 
-  // Receive packets buffer.
-  PacketQueue recv_buffer_;
-  std::mutex recv_buffer_mutex_;
-  std::condition_variable recv_buffer_cv_;
+  void PacketsSendListener();
 
-  // Send packets buffer.
-  PacketQueue send_buffer_;
-  std::mutex send_buffer_mutex_;
-  std::condition_variable send_buffer_cv_;
+  std::string ip_address_;  // Human readable IP address (aa.bb.cc.dd)
+  BaseChannel* channel_;  // This is the channel to send packets.
+
+  // Receive packets queue.
+  PacketQueue recv_pkt_queue_;
+  std::mutex recv_pkt_queue_mutex_;
+  std::condition_variable recv_pkt_queue_cv_;
+
+  // Send packets queue.
+  PacketQueue send_pkt_queue_;
+  std::mutex send_pkt_queue_mutex_;
+  std::condition_variable send_pkt_queue_cv_;
 
   // All TCP connections maintained by this host.
   using TcpConnectionMap = 
       std::unordered_map<TcpControllerKey, std::unique_ptr<TcpController>>;
   TcpConnectionMap connections_;
 
-  // Thread pool. We create a top-level thread pool to manage all threads.
-  // It should be passed to all TCP connections for usage.
+  // This map maintains socket fd --> TcpController
+  std::mutex socket_tcp_map_mutex_;
+  std::unordered_map<uint32, TcpController*> socket_tcp_map_;
+
+  // Thread pool.
   Executors::FixedThreadPool thread_pool_;
 };
 

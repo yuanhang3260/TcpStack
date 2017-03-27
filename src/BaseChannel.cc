@@ -38,6 +38,14 @@ void BaseChannel::Send(std::unique_ptr<Packet> packet) {
   pkt_buffer_cv_.notify_one();
 }
 
+void BaseChannel::Send(std::queue<std::unique_ptr<Packet>>* pkts_to_send) {
+  {
+    std::unique_lock<std::mutex> lock(pkt_buffer_mutex_);
+    pkt_buffer_.Push(pkts_to_send);
+  }
+  pkt_buffer_cv_.notify_one();
+}
+
 void BaseChannel::Send(Packet* packet) {
   {
     std::unique_lock<std::mutex> lock(pkt_buffer_mutex_);
@@ -67,7 +75,7 @@ void BaseChannel::WaitingForPackets() {
     {
       std::unique_lock<std::mutex> lock(cb_mutex_);
       if (receiver_callback_) {
-        receiver_callback_(new_packets);
+        receiver_callback_(&new_packets);
       }
     }
   }

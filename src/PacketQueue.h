@@ -15,9 +15,10 @@ class PacketQueue {
   PacketQueue() = default;
 
   void Push(std::unique_ptr<Packet> ele);
+  uint32 Push(std::queue<std::unique_ptr<Packet>>* pkts);
 
   std::unique_ptr<Packet> DeQueue();
-  int DeQueueAllTo(std::queue< std::unique_ptr<Packet> >* receiver_queue);
+  uint32 DeQueueAllTo(std::queue< std::unique_ptr<Packet> >* receiver_queue);
 
   uint32 size() const;
   bool empty() const;

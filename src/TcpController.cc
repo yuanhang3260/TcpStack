@@ -3,28 +3,54 @@
 #include "Base/Log.h"
 #include "Base/MacroUtils.h"
 #include "Base/Utils.h"
+#include "Host.h"
 #include "TcpController.h"
 
 namespace net_stack {
 
 namespace {
-uint32 kThreadPoolSize = 6;
+uint32 kThreadPoolSize = 3;
+
 uint32 kDefaultDataPacketSize = 1000;
+
+uint32 kDefaultSocketBufferSize = 65536;
+uint32 kDefaultWindowBase = 0;
+uint32 kDefaultWindowSize = 65536;
 }
 
-TcpController::TcpController(Host* host, const TcpControllerOptions& options) :
+TcpController::TcpController(Host* host,
+                             const TcpControllerKey& tcp_key,
+                             uint32 socket_fd,
+                             const TcpControllerOptions& options) :
     host_(host),
+    key_(tcp_key),
+    socket_fd_(socket_fd),
     thread_pool_(kThreadPoolSize),
-    key_(options.key),
     recv_window_(options.recv_window_base, options.recv_window_size),
     recv_buffer_(options.recv_buffer_size),
     send_buffer_(options.send_buffer_size),
     send_window_(options.send_window_base, options.send_window_size),
     timer_(std::chrono::seconds(1),
            std::bind(&TcpController::TimeoutReTransmitter, this)) {
+  thread_pool_.AddTask(
+      std::bind(&TcpController::PacketReceiveBufferListner, this));
+  thread_pool_.AddTask(
+      std::bind(&TcpController::SocketSendBufferListener, this));
+  thread_pool_.AddTask(
+      std::bind(&TcpController::PacketSendBufferListner, this));
+  thread_pool_.Start();
 }
 
-// This method just enqueue the new packet into this TCP connection's private
+TcpControllerOptions TcpController::GetDefaultOptions() {
+  return TcpControllerOptions{kDefaultSocketBufferSize,  // socket send buffer
+                              kDefaultWindowBase,  // send window base
+                              kDefaultWindowSize,  // send window size
+                              kDefaultSocketBufferSize,  // socket recv buffer
+                              kDefaultWindowBase,  // recv window base
+                              kDefaultWindowSize};  // recv window size
+}
+
+// This method just enqueue the new packets into this TCP connection's private
 // packet receive buffer. It is PacketReceiveBufferListner that monitors this
 // queue and handles packets.
 void TcpController::ReceiveNewPacket(std::unique_ptr<Packet> packet) {
@@ -122,7 +148,7 @@ int32 TcpController::WriteData(const byte* buf, int32 size) {
   uint32 writen = 0;
   {
     std::unique_lock<std::mutex> lock(send_buffer_mutex_);
-    // Non-blocking mode?
+    // TODO: Non-blocking mode?
     send_buffer_write_cv_.wait(lock,
         [this] { return !send_buffer_.full(); });
     writen = send_buffer_.Write(buf, size);
@@ -197,12 +223,16 @@ void TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
 
 void TcpController::PacketSendBufferListner() {
   while (true) {
-    std::unique_lock<std::mutex> lock(pkt_send_buffer_mutex_);
-    pkt_send_buffer_cv_.wait(lock,
-        [this] { return !pkt_send_buffer_.empty(); });
+    std::queue<std::unique_ptr<Packet>> packets_to_send;
+    {
+      std::unique_lock<std::mutex> lock(pkt_send_buffer_mutex_);
+      pkt_send_buffer_cv_.wait(lock,
+          [this] { return !pkt_send_buffer_.empty(); });
+      pkt_send_buffer_.DeQueueAllTo(&packets_to_send);
+    }
 
     // Deliver packets to host buffer.
-    //host->GetPacketsFromLocalTcp(pkt_send_buffer_);
+    host_->MultiplexPacketsFromTcp(&packets_to_send);
   }
 }
 

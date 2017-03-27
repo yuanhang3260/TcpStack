@@ -19,12 +19,14 @@
 
 namespace net_stack {
 
+class Host;
+
 // TCP uses <source_ip, source_port, dest_ip, dest_port> as unique indentifier.
 struct TcpControllerKey {
   std::string source_ip;
-  int source_port;
+  uint32 source_port;
   std::string dest_ip;
-  int dest_port;
+  uint32 dest_port;
 
   bool operator==(const TcpControllerKey &other) const { 
     return (source_ip == other.source_ip && source_port == other.source_port &&
@@ -47,26 +49,28 @@ struct TcpControllerKey {
 
     return false;
   }
+
+  std::string DebugString() const {
+    return "{" + source_ip + ", " + std::to_string(source_port) + ", " +
+           dest_ip + ", " + std::to_string(dest_port) + "}";
+  }
 };
 
-class Host;
-
 struct TcpControllerOptions {
-  TcpControllerKey key;
+  uint32 send_buffer_size;
+  uint32 send_window_base;
+  uint32 send_window_size;
 
-  uint32 send_buffer_size = 0;
-  uint32 send_window_base = 0;
-  uint32 send_window_size = 0;
-
-  uint32 recv_buffer_size = 0;
-  uint32 recv_window_base = 0;
-  uint32 recv_window_size = 0;
+  uint32 recv_buffer_size;
+  uint32 recv_window_base;
+  uint32 recv_window_size;
 };
 
 // TcpController is completely event-driven. It has monitors for all 
 class TcpController {
  public:
-  TcpController(Host* host, const TcpControllerOptions& options);
+  TcpController(Host* host, const TcpControllerKey& tcp_id, uint32 socket_fd,
+                const TcpControllerOptions& options);
 
   static TcpControllerOptions GetDefaultOptions();
 
@@ -100,9 +104,10 @@ class TcpController {
   std::unique_ptr<Packet> MakeAckPacket(uint32 ack_num);
 
   Host* host_ = nullptr;
-  Executors::FixedThreadPool thread_pool_;
-
   TcpControllerKey key_;
+  uint32 socket_fd_;
+
+  Executors::FixedThreadPool thread_pool_;
 
   // ************** Receive Pipeline ************** //
   // Packet receive buffer. This is the low-level queue to buffer received
@@ -144,13 +149,13 @@ class TcpController {
 namespace std {
 template <>
 struct hash<net_stack::TcpControllerKey> {
-  size_t operator() (const net_stack::TcpControllerKey& socket_id) const {
+  size_t operator() (const net_stack::TcpControllerKey& tcp_id) const {
     std::hash<std::string> str_hasher;
     std::hash<int> int_hasher;
-      return ((str_hasher(socket_id.source_ip) ^
-              (int_hasher(socket_id.source_port) << 1)) >> 1) ^
-             (((str_hasher(socket_id.dest_ip) << 2) ^
-               (int_hasher(socket_id.dest_port) << 2)) >> 2);
+      return ((str_hasher(tcp_id.source_ip) ^
+              (int_hasher(tcp_id.source_port) << 1)) >> 1) ^
+             (((str_hasher(tcp_id.dest_ip) << 2) ^
+               (int_hasher(tcp_id.dest_port) << 2)) >> 2);
   }
 };
 }  // namespace

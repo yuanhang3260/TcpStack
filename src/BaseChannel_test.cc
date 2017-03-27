@@ -14,10 +14,10 @@ class BaseChannelTest: public UnitTest {
  public:
   void setup() {
     channel_.RegisterReceiverCallback(
-      [&] (std::queue<std::unique_ptr<Packet>>& new_packets) {
+      [&] (std::queue<std::unique_ptr<Packet>>* new_packets) {
         //printf("Receiving packets\n");
-        num_packets_received_ += new_packets.size();
-        new_packets.swap(receiver_buffer_);
+        num_packets_received_ += new_packets->size();
+        new_packets->swap(receiver_buffer_);
       });
     channel_.Start();
   }
