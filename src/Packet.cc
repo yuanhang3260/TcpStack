@@ -45,6 +45,11 @@ uint32 Packet::InjectPayload(const byte* data, int size) {
 
 uint32 Packet::InjectPayloadFromBuffer(
     Utility::BufferInterface* src_buffer, uint32 size) {
+  if (payload_) {
+    delete[] payload_;
+  }
+  payload_ = new byte[size];
+
   payload_size_ = src_buffer->Read(payload_, size);
   return payload_size_;
 }

@@ -18,7 +18,8 @@ namespace net_stack {
 
 class Host {
  public:
-  Host(const std::string& ip_address, BaseChannel* channel);
+  Host(const std::string& hostname, const std::string& ip_address,
+       BaseChannel* channel);
   ~Host();
 
   // This is the callback passed to channel. Channel use it to move packets
@@ -38,6 +39,7 @@ class Host {
   int32 ReadData(uint32 socket_fd, byte* buffer, int32 size);
   int32 WriteData(uint32 socket_fd, const byte* buffer, int32 size);
 
+  std::string hostname() const { return hostname_; }
   std::string ip_address() const { return ip_address_; }
 
  private:
@@ -47,6 +49,9 @@ class Host {
 
   void PacketsSendListener();
 
+  void debuginfo(const std::string& msg);
+
+  std::string hostname_;
   std::string ip_address_;  // Human readable IP address (aa.bb.cc.dd)
   BaseChannel* channel_;  // This is the channel to send packets.
 

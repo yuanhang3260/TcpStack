@@ -18,14 +18,14 @@ const uint32 kBobPort = 20;
 const uint32 kAliceSocket = 5;
 const uint32 kBobSocket = 5;
 
-const uint32 kTestDataSize = 20;
+const uint32 kTestDataSize = 30;
 byte* data;
 byte* receive_buffer;
 
 void InitData() {
   data = new byte[kTestDataSize];
   for (uint32 i = 0; i < kTestDataSize; i++) {
-    data[i] = Utils::RandomNumber(256);
+    data[i] = 'a';//Utils::RandomNumber(256);
   }
 
   receive_buffer = new byte[kTestDataSize];
@@ -34,6 +34,7 @@ void InitData() {
 bool ReceivedDataCorrect() {
   for (uint32 i = 0; i < kTestDataSize; i++) {
     if (receive_buffer[i] != data[i]) {
+      printf("i = %d, '%c' and '%c'\n", i, receive_buffer[i], data[i]);
       return false;
     }
   }
@@ -48,8 +49,8 @@ int main(int argc, char** argv) {
   BaseChannel channel_bob_to_alice;
 
   // Hello, Alice and Bob.
-  Host alice(kAliceIP, &channel_alice_to_bob);
-  Host bob(kBobIP, &channel_bob_to_alice);
+  Host alice("Alice", kAliceIP, &channel_alice_to_bob);
+  Host bob("Bob", kBobIP, &channel_bob_to_alice);
 
   // Register receiver's callback to channel.
   channel_alice_to_bob.RegisterReceiverCallback(
@@ -69,7 +70,8 @@ int main(int argc, char** argv) {
   auto alice_thread = [&] () {
     uint32 writen = 0;
     while (writen < kTestDataSize) {
-      auto re = alice.WriteData(kAliceSocket, data + writen, kTestDataSize);
+      auto re = alice.WriteData(kAliceSocket, data + writen,
+                                kTestDataSize - writen);
       if (re > 0) {
         writen += re;
       }
@@ -86,6 +88,7 @@ int main(int argc, char** argv) {
       if (re > 0) {
         readn += re;
       }
+      //printf("readn = %d\n", readn);
     }
     if (readn != kTestDataSize) {
       LogERROR("Bob received %d bytes data\n", readn);

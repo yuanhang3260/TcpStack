@@ -36,9 +36,9 @@ bool SendWindow::SendPacket(std::shared_ptr<Packet> new_pkt) {
     SANITY_CHECK(last_seq_num + last_pkt_length == send_base_ + size_,
                  "last un-acked pkt mismatch with (send_base + size)");
     if (new_pkt->tcp_header().seq_num != last_seq_num + last_pkt_length) {
-      LogERROR("Send queue has last packet %u size %u, "
-               "expect to send next packet seq num = %d, "
-               "can't send a new packet with seq num = %u",
+      LogERROR("Send queue has last packet (seq_num = %u, size = %u), "
+               "expect to send next packet seq_num = %d, "
+               "can't send a new packet with seq_num = %u",
                last_seq_num, last_pkt_length,
                last_seq_num + last_pkt_length,
                new_pkt->tcp_header().seq_num);

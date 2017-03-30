@@ -104,6 +104,8 @@ class TcpController {
   
   std::unique_ptr<Packet> MakeAckPacket(uint32 ack_num);
 
+  void debuginfo(const std::string& msg);
+
   Host* host_ = nullptr;
   TcpControllerKey key_;
   uint32 socket_fd_;

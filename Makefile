@@ -63,6 +63,7 @@ test/%.out: $(OBJ_DIR)/%.o library
 
 
 clean:
+	rm -rf main
 	rm -rf libtcp.a
 	rm -rf $(OBJ_DIR)/*.o
 	rm -rf test/*.out

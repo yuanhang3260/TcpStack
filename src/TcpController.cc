@@ -11,7 +11,7 @@ namespace net_stack {
 namespace {
 uint32 kThreadPoolSize = 3;
 
-uint32 kDefaultDataPacketSize = 1000;
+uint32 kDefaultDataPacketSize = 10;
 
 uint32 kDefaultSocketBufferSize = 65536;
 uint32 kDefaultWindowBase = 0;
@@ -160,7 +160,7 @@ void TcpController::SocketSendBufferListener() {
     // Wait for send window to be not full.
     std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
     send_window_cv_.wait(lock_send_window,
-        [this] { return !send_window_.free_space() > 0; });
+        [this] { return send_window_.free_space() > 0; });
     lock_send_window.unlock();
 
     // Wait for socket send buffer to have data to send.
@@ -187,7 +187,9 @@ void TcpController::SocketSendBufferListener() {
       auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
                                          &send_buffer_, kDefaultDataPacketSize);
       // This just mark the new pkt into send window.
-      send_window_.SendPacket(new_data_pkt);
+      if (!send_window_.SendPacket(new_data_pkt)) {
+        continue;
+      }
       // Really send the packet.
       SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
       if (restart_timer) {
@@ -199,7 +201,9 @@ void TcpController::SocketSendBufferListener() {
       bool restart_timer = (send_window_.size() == 0);
       auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
                                          &send_buffer_, last_pkt_size);
-      send_window_.SendPacket(new_data_pkt);
+      if (!send_window_.SendPacket(new_data_pkt)) {
+        continue;
+      }
       SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
       if (restart_timer) {
         timer_.Restart();
@@ -211,6 +215,11 @@ void TcpController::SocketSendBufferListener() {
 }
 
 void TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
+  std::string debug_msg = pkt->tcp_header().ack ?
+      "ack " + std::to_string(pkt->tcp_header().ack_num) :
+      "send " + std::to_string(pkt->tcp_header().seq_num);
+  debuginfo(debug_msg);
+
   pkt_send_buffer_.Push(std::move(pkt));
 }
 
@@ -236,8 +245,15 @@ void TcpController::TimeoutReTransmitter() {
 std::shared_ptr<Packet> TcpController::MakeDataPacket(
     uint32 seq_num, const byte* data, uint32 size) {
   IPHeader ip_header;
+  ip_header.source_ip = key_.source_ip;
+  ip_header.dest_ip = key_.dest_ip;
+
   TcpHeader tcp_header;
+  tcp_header.source_port = key_.source_port;
+  tcp_header.dest_port = key_.dest_port;
+  tcp_header.seq_num = seq_num;
   tcp_header.ack = false;
+
   std::shared_ptr<Packet> pkt(new Packet(ip_header, tcp_header, data, size));
   return pkt;
 }
@@ -245,8 +261,15 @@ std::shared_ptr<Packet> TcpController::MakeDataPacket(
 std::shared_ptr<Packet> TcpController::MakeDataPacket(
     uint32 seq_num, Utility::BufferInterface* data_buffer, uint32 size) {
   IPHeader ip_header;
+  ip_header.source_ip = key_.source_ip;
+  ip_header.dest_ip = key_.dest_ip;
+
   TcpHeader tcp_header;
+  tcp_header.source_port = key_.source_port;
+  tcp_header.dest_port = key_.dest_port;
+  tcp_header.seq_num = seq_num;
   tcp_header.ack = false;
+
   std::shared_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
   pkt->InjectPayloadFromBuffer(data_buffer, size);
   return pkt;
@@ -254,11 +277,21 @@ std::shared_ptr<Packet> TcpController::MakeDataPacket(
 
 std::unique_ptr<Packet> TcpController::MakeAckPacket(uint32 ack_num) {
   IPHeader ip_header;
+  ip_header.source_ip = key_.source_ip;
+  ip_header.dest_ip = key_.dest_ip;
+
   TcpHeader tcp_header;
+  tcp_header.source_port = key_.source_port;
+  tcp_header.dest_port = key_.dest_port;
   tcp_header.ack = true;
   tcp_header.ack_num = ack_num;
+
   std::unique_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
   return pkt;
+}
+
+void TcpController::debuginfo(const std::string& msg) {
+  LogINFO((host_->hostname() + ": " + msg).c_str());
 }
 
 }  // namespace net_stack

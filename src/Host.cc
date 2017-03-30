@@ -4,7 +4,9 @@
 
 namespace net_stack {
 
-Host::Host(const std::string& ip_address, BaseChannel* channel) :
+Host::Host(const std::string& hostname, const std::string& ip_address,
+           BaseChannel* channel) :
+    hostname_(hostname),
     ip_address_(ip_address),
     channel_(channel),
     thread_pool_(2) {
@@ -37,13 +39,14 @@ void Host::DemultiplexPacketsToTcps(
   uint32 size = new_packets->size();
   for (uint32 i = 0; i < size; i++) {
     auto& pkt = new_packets->front();
-    TcpControllerKey tcp_key{pkt->ip_header().source_ip,
-                             pkt->tcp_header().source_port,
-                             pkt->ip_header().dest_ip,
-                             pkt->tcp_header().dest_port};
+    TcpControllerKey tcp_key{pkt->ip_header().dest_ip,
+                             pkt->tcp_header().dest_port,
+                             pkt->ip_header().source_ip,
+                             pkt->tcp_header().source_port};
     auto it = connections_.find(tcp_key);
     if (it == connections_.end()) {
-      LogERROR("Can't find tcp connection %s", tcp_key.DebugString().c_str());
+      LogERROR("%s: Can't find tcp connection %s",
+               hostname_.c_str(), tcp_key.DebugString().c_str());
       continue;
     }
     it->second->ReceiveNewPacket(std::move(pkt));
@@ -104,6 +107,10 @@ int32 Host::WriteData(uint32 socket_fd, const byte* buffer, int32 size) {
     tcp_conn = it->second;
   }
   return tcp_conn->WriteData(buffer, size);
+}
+
+void Host::debuginfo(const std::string& msg) {
+  LogERROR((hostname_ + ": " + msg).c_str());
 }
 
 }  // namespace net_stack
