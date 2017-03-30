@@ -50,28 +50,25 @@ TcpControllerOptions TcpController::GetDefaultOptions() {
                               kDefaultWindowSize};  // recv window size
 }
 
+TcpController::~TcpController() {
+  pkt_recv_buffer_.Stop();
+  pkt_send_buffer_.Stop();
+  thread_pool_.Stop();
+  thread_pool_.AwaitTermination();
+}
+
 // This method just enqueue the new packets into this TCP connection's private
 // packet receive buffer. It is PacketReceiveBufferListner that monitors this
 // queue and handles packets.
 void TcpController::ReceiveNewPacket(std::unique_ptr<Packet> packet) {
-  {
-    std::unique_lock<std::mutex> lock(pkt_recv_buffer_mutex_);
-    pkt_recv_buffer_.Push(std::move(packet));
-  }
-  pkt_recv_buffer_cv_.notify_one();
+  pkt_recv_buffer_.Push(std::move(packet));
 }
 
 void TcpController::PacketReceiveBufferListner() {
   while (1) {
+    // Get all new packets.
     std::queue<std::unique_ptr<Packet>> new_packets;
-    {
-      std::unique_lock<std::mutex> lock(pkt_recv_buffer_mutex_);
-      pkt_recv_buffer_cv_.wait(lock,
-          [this] { return !pkt_recv_buffer_.empty(); });
-
-      // Get all new packets.
-      pkt_recv_buffer_.DeQueueAllTo(&new_packets);
-    }
+    pkt_recv_buffer_.DeQueueAllTo(&new_packets);
 
     HandleReceivedPackets(&new_packets);
     SANITY_CHECK(new_packets.empty(),
@@ -214,22 +211,13 @@ void TcpController::SocketSendBufferListener() {
 }
 
 void TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
-  {
-    std::unique_lock<std::mutex> lock(pkt_send_buffer_mutex_);
-    pkt_send_buffer_.Push(std::move(pkt));
-  }
-  pkt_send_buffer_cv_.notify_one();
+  pkt_send_buffer_.Push(std::move(pkt));
 }
 
 void TcpController::PacketSendBufferListner() {
   while (true) {
     std::queue<std::unique_ptr<Packet>> packets_to_send;
-    {
-      std::unique_lock<std::mutex> lock(pkt_send_buffer_mutex_);
-      pkt_send_buffer_cv_.wait(lock,
-          [this] { return !pkt_send_buffer_.empty(); });
-      pkt_send_buffer_.DeQueueAllTo(&packets_to_send);
-    }
+    pkt_send_buffer_.DeQueueAllTo(&packets_to_send);
 
     // Deliver packets to host buffer.
     host_->MultiplexPacketsFromTcp(&packets_to_send);

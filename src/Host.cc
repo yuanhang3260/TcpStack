@@ -13,25 +13,21 @@ Host::Host(const std::string& ip_address, BaseChannel* channel) :
   thread_pool_.Start();
 }
 
+Host::~Host() {
+  recv_pkt_queue_.Stop();
+  send_pkt_queue_.Stop();
+}
+
 void Host::MovePacketsFromChannel(
     std::queue<std::unique_ptr<Packet>>* packets_to_receive) {
-  {
-    std::unique_lock<std::mutex> lock(recv_pkt_queue_mutex_);
-    recv_pkt_queue_.Push(packets_to_receive);
-    SANITY_CHECK(packets_to_receive->empty(), "packets_to_receive not emptied");
-  }
-  recv_pkt_queue_cv_.notify_one();
+  recv_pkt_queue_.Push(packets_to_receive);
+  SANITY_CHECK(packets_to_receive->empty(), "packets_to_receive not emptied");
 }
 
 void Host::PacketsReceiveListener() {
   while (true) {
     std::queue<std::unique_ptr<Packet>> new_packets;
-    {
-      std::unique_lock<std::mutex> lock(recv_pkt_queue_mutex_);
-      recv_pkt_queue_cv_.wait(lock,
-                              [this] { return !recv_pkt_queue_.empty(); });
-      recv_pkt_queue_.DeQueueAllTo(&new_packets);
-    }
+    recv_pkt_queue_.DeQueueAllTo(&new_packets);
     DemultiplexPacketsToTcps(&new_packets);
   }
 }
@@ -57,23 +53,14 @@ void Host::DemultiplexPacketsToTcps(
 
 void Host::MultiplexPacketsFromTcp(
     std::queue<std::unique_ptr<Packet>>* packets_to_send) {
-  {
-    std::unique_lock<std::mutex> lock(send_pkt_queue_mutex_);
-    send_pkt_queue_.Push(packets_to_send);
-    SANITY_CHECK(packets_to_send->empty(), "packets_to_send not emptied!");
-  }
-  send_pkt_queue_cv_.notify_one();
+  send_pkt_queue_.Push(packets_to_send);
+  SANITY_CHECK(packets_to_send->empty(), "packets_to_send not emptied!");
 }
 
 void Host::PacketsSendListener() {
   while (true) {
     std::queue<std::unique_ptr<Packet>> packets_to_send;
-    {
-      std::unique_lock<std::mutex> lock(send_pkt_queue_mutex_);
-      send_pkt_queue_cv_.wait(lock,
-                              [this] { return !send_pkt_queue_.empty(); });
-      send_pkt_queue_.DeQueueAllTo(&packets_to_send);
-    }
+    send_pkt_queue_.DeQueueAllTo(&packets_to_send);
     // Send to channel.
     channel_->Send(&packets_to_send);
   }
@@ -98,6 +85,7 @@ int32 Host::ReadData(uint32 socket_fd, byte* buffer, int32 size) {
     auto it = socket_tcp_map_.find(socket_fd);
     if (it == socket_tcp_map_.end()) {
       LogERROR("Can't find tcp connection bind with socket %u", socket_fd);
+      return -1;
     }
     tcp_conn = it->second;
   }
@@ -111,6 +99,7 @@ int32 Host::WriteData(uint32 socket_fd, const byte* buffer, int32 size) {
     auto it = socket_tcp_map_.find(socket_fd);
     if (it == socket_tcp_map_.end()) {
       LogERROR("Can't find tcp connection bind with socket %u", socket_fd);
+      return -1;
     }
     tcp_conn = it->second;
   }

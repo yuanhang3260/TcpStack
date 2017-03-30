@@ -1,7 +1,6 @@
 #ifndef NET_STACK_HOST_
 #define NET_STACK_HOST_
 
-#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -20,6 +19,7 @@ namespace net_stack {
 class Host {
  public:
   Host(const std::string& ip_address, BaseChannel* channel);
+  ~Host();
 
   // This is the callback passed to channel. Channel use it to move packets
   // to host's receive queue.
@@ -52,13 +52,9 @@ class Host {
 
   // Receive packets queue.
   PacketQueue recv_pkt_queue_;
-  std::mutex recv_pkt_queue_mutex_;
-  std::condition_variable recv_pkt_queue_cv_;
 
   // Send packets queue.
   PacketQueue send_pkt_queue_;
-  std::mutex send_pkt_queue_mutex_;
-  std::condition_variable send_pkt_queue_cv_;
 
   // All TCP connections maintained by this host.
   using TcpConnectionMap = 

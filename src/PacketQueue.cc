@@ -1,35 +1,57 @@
 #include <thread>
 
+#include "Utility/CleanUp.h"
 #include "PacketQueue.h"
 
 namespace net_stack {
 
 PacketQueue::PacketQueue() {
   destroy_.store(false);
+  num_readers_ = 0;
 }
 
 PacketQueue::~PacketQueue() {
+  Stop();
+}
+
+void PacketQueue::Stop() {
   destroy_.store(true);
   cv_.notify_all();
+
+  // Wait for all reading client threads to return.
+  {
+    std::unique_lock<std::mutex> lock(num_readers_mutex_);
+    num_readers_cv_.wait(lock, [this] { return num_readers_ <= 0; });
+  }
 }
 
 bool PacketQueue::Push(std::unique_ptr<Packet> new_ele) {
-  std::unique_lock<std::mutex> lock(mutex_);
-  packets_.push(std::move(new_ele));
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    packets_.push(std::move(new_ele));
+  }
+  cv_.notify_one();
   return true;
 }
 
 uint32 PacketQueue::Push(std::queue<std::unique_ptr<Packet>>* pkts) {
-  std::unique_lock<std::mutex> lock(mutex_);
   uint32 size = pkts->size();
-  for (uint32 i = 0; i < size; i++) {
-    packets_.push(std::move(pkts->front()));
-    pkts->pop();
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (uint32 i = 0; i < size; i++) {
+      packets_.push(std::move(pkts->front()));
+      pkts->pop();
+    }
   }
+
+  cv_.notify_one();
   return size;
 }
 
 std::unique_ptr<Packet> PacketQueue::DeQueue(bool blocking) {
+  IncReaders();
+  auto cleanup = Utility::CleanUp(std::bind(&PacketQueue::DecReaders, this));
+
   std::unique_lock<std::mutex> lock(mutex_);
   if (!blocking) {
     if (packets_.empty()) {
@@ -54,6 +76,9 @@ std::unique_ptr<Packet> PacketQueue::DeQueue(bool blocking) {
 
 uint32 PacketQueue::DeQueueAllTo(
     std::queue< std::unique_ptr<Packet> >* receiver_queue, bool blocking) {
+  IncReaders();
+  auto cleanup = Utility::CleanUp(std::bind(&PacketQueue::DecReaders, this));
+
   std::unique_lock<std::mutex> lock(mutex_);
   if (!blocking) {
     if (packets_.empty()) {
@@ -74,6 +99,24 @@ uint32 PacketQueue::DeQueueAllTo(
   uint32 total_size = packets_.size();
   receiver_queue->swap(packets_);
   return total_size;
+}
+
+void PacketQueue::IncReaders() {
+  std::unique_lock<std::mutex> lock(num_readers_mutex_);
+  num_readers_++;
+}
+
+void PacketQueue::DecReaders() {
+  bool last_reader = false;
+  {
+    std::unique_lock<std::mutex> lock(num_readers_mutex_);
+    last_reader = (num_readers_ == 1);
+    num_readers_--;
+  }
+
+  if (destroy_.load() && last_reader) {
+    num_readers_cv_.notify_one();
+  }
 }
 
 uint32 PacketQueue::size() {

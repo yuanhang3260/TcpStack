@@ -29,15 +29,27 @@ class PacketQueue {
   uint32 DeQueueAllTo(std::queue< std::unique_ptr<Packet> >* receiver_queue,
                       bool blocking = true);
 
+  // Stop the channel. Stop() is necessary to provides a safe destruction for
+  // this class. It waits for all clients that have not yet returned from
+  // a blocking DeQueue or DeQueueAllTo.
+  void Stop();
+
   uint32 size();
   bool empty();
 
  private:
+  void IncReaders();
+  void DecReaders();
+
   std::queue<std::unique_ptr<Packet>> packets_;
   std::mutex mutex_;
   std::condition_variable cv_;
 
   std::atomic_bool destroy_;
+
+  uint32 num_readers_;
+  std::mutex num_readers_mutex_;
+  std::condition_variable num_readers_cv_;
 };
 
 }  // namespace net_stack

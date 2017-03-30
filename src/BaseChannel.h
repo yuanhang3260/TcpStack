@@ -1,10 +1,9 @@
 #ifndef NET_STACK_BASE_CHANNEL_
 #define NET_STACK_BASE_CHANNEL_
 
-#include <condition_variable>
+#include <atomic>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <thread>
 
 #include "Base/BaseTypes.h"
@@ -50,15 +49,13 @@ class BaseChannel {
   // receiver when new packets are available.
   void WaitingForPackets();
 
-  std::mutex pkt_buffer_mutex_;
-  std::condition_variable pkt_buffer_cv_;
   PacketQueue pkt_buffer_;
 
   std::mutex cb_mutex_;
   ReceiverCallBack receiver_callback_;
 
   std::thread listner_;
-  bool stop_ = true;
+  std::atomic_bool stop_;
 };
 
 }  // namespace net_stack

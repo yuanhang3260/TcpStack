@@ -71,6 +71,7 @@ class TcpController {
  public:
   TcpController(Host* host, const TcpControllerKey& tcp_id, uint32 socket_fd,
                 const TcpControllerOptions& options);
+  ~TcpController();
 
   static TcpControllerOptions GetDefaultOptions();
 
@@ -113,8 +114,6 @@ class TcpController {
   // Packet receive buffer. This is the low-level queue to buffer received
   // packets delivered from host (namely layer 2).
   PacketQueue pkt_recv_buffer_;
-  std::mutex pkt_recv_buffer_mutex_;
-  std::condition_variable pkt_recv_buffer_cv_;
   // Recv window. No mutex needed. Only PacketReceiveBufferListner thread
   // use it.
   RecvWindow recv_window_;
@@ -136,8 +135,6 @@ class TcpController {
   // Packet send buffer. This is the low-level queue to buffer packets to send
   // to host (namely layer 2).
   PacketQueue pkt_send_buffer_;
-  std::mutex pkt_send_buffer_mutex_;
-  std::condition_variable pkt_send_buffer_cv_;
 
   // Timer
   Utility::Timer timer_;

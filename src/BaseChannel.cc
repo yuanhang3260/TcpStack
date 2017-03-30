@@ -1,84 +1,59 @@
 #include <string>
 
+#include "Base/Log.h"
 #include "BaseChannel.h"
 
 namespace net_stack {
 
 BaseChannel::BaseChannel(ReceiverCallBack receiver_callback) :
     receiver_callback_(std::move(receiver_callback)) {
+  stop_.store(true, std::memory_order_relaxed);
 }
 
 BaseChannel::~BaseChannel() {
-  {
-    std::unique_lock<std::mutex> lock(pkt_buffer_mutex_);
-    stop_ = true;
-  }
-  pkt_buffer_cv_.notify_one();
+  stop_.store(true, std::memory_order_relaxed);
+  pkt_buffer_.Stop();
+
   if (listner_.joinable()) {
     listner_.join();
   }
 }
 
 void BaseChannel::Start() {
-  {
-    std::unique_lock<std::mutex> lock(pkt_buffer_mutex_);
-    if (!stop_) {
-      return;
-    }
-    stop_ = false;
-  }
+  stop_.store(false, std::memory_order_relaxed);
   listner_ = std::thread(std::bind(&BaseChannel::WaitingForPackets, this));
 }
 
 void BaseChannel::Send(std::unique_ptr<Packet> packet) {
-  {
-    std::unique_lock<std::mutex> lock(pkt_buffer_mutex_);
-    pkt_buffer_.Push(std::move(packet));
-  }
-  pkt_buffer_cv_.notify_one();
+  pkt_buffer_.Push(std::move(packet));
 }
 
 void BaseChannel::Send(std::queue<std::unique_ptr<Packet>>* pkts_to_send) {
-  {
-    std::unique_lock<std::mutex> lock(pkt_buffer_mutex_);
-    pkt_buffer_.Push(pkts_to_send);
-  }
-  pkt_buffer_cv_.notify_one();
+  pkt_buffer_.Push(pkts_to_send);
 }
 
 void BaseChannel::Send(Packet* packet) {
-  {
-    std::unique_lock<std::mutex> lock(pkt_buffer_mutex_);
-    pkt_buffer_.Push(std::unique_ptr<Packet>(packet));
+  pkt_buffer_.Push(std::unique_ptr<Packet>(packet));
+}
+
+void BaseChannel::WaitingForPackets() {
+  while (!stop_.load(std::memory_order_relaxed)) {
+    std::queue<std::unique_ptr<Packet>> new_packets;
+    auto re = pkt_buffer_.DeQueueAllTo(&new_packets);
+    if (re == 0) {
+      continue;
+    }
+
+    std::unique_lock<std::mutex> lock(cb_mutex_);
+    if (receiver_callback_) {
+      receiver_callback_(&new_packets);
+    }
   }
-  pkt_buffer_cv_.notify_one();
 }
 
 void BaseChannel::RegisterReceiverCallback(ReceiverCallBack receiver_callback) {
   std::unique_lock<std::mutex> lock(cb_mutex_);
   receiver_callback_ = std::move(receiver_callback);
-}
-
-void BaseChannel::WaitingForPackets() {
-  while (1) {
-    std::queue<std::unique_ptr<Packet>> new_packets;
-    {
-      std::unique_lock<std::mutex> lock(pkt_buffer_mutex_);
-      pkt_buffer_cv_.wait(lock,
-                          [this] { return !pkt_buffer_.empty() || stop_; });
-      if (stop_) {
-        break;
-      }
-      pkt_buffer_.DeQueueAllTo(&new_packets);
-    }
-
-    {
-      std::unique_lock<std::mutex> lock(cb_mutex_);
-      if (receiver_callback_) {
-        receiver_callback_(&new_packets);
-      }
-    }
-  }
 }
 
 }  // namespace net_stack

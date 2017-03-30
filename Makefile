@@ -6,7 +6,7 @@
 MAKE=make
 CC=g++ -std=c++11
 CFLAGS=-Wall -Werror -O2
-LFLAGS=-lssl -lcrypto -pthread
+LFLAGS=-pthread
 IFLAGS=-Isrc/ -Isrc/Public/
 
 SRC_DIR=src
@@ -36,7 +36,9 @@ TESTEXE = test/PacketQueue_test.out \
           test/RecvWindow_test.out \
           test/SendWindow_test.out \
 
-all: libhy library
+MAINOBJ = $(OBJ_DIR)/main.o
+
+all: libhy library main
 
 test: library $(TESTEXE)
 
@@ -45,6 +47,10 @@ libhy:
 
 library: $(OBJ)
 	ar cr libtcp.a $(OBJ)
+
+main: $(SRC_DIR)/main.cc library
+	$(CC) $(CFLAGS) $(IFLAGS) $(LFLAGS) -c $(SRC_DIR)/main.cc -o $(MAINOBJ)
+	$(CC) $(CFLAGS) $(LFLAGS) $(MAINOBJ) libtcp.a $(HYLIB) -o $@
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cc
 	$(CC) $(CFLAGS) $(IFLAGS) -c $< -o $@
