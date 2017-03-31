@@ -1,9 +1,19 @@
 #include <string>
 
 #include "Base/Log.h"
+#include "Base/Utils.h"
 #include "BaseChannel.h"
 
 namespace net_stack {
+
+namespace {
+
+//uint32 error_indexer = 0;
+
+const double kPacketLossRatio = 0.2;
+const double kPacketCorruptRatio = 0;
+
+}  // namespace
 
 BaseChannel::BaseChannel(ReceiverCallBack receiver_callback) :
     receiver_callback_(std::move(receiver_callback)) {
@@ -29,7 +39,37 @@ void BaseChannel::Send(std::unique_ptr<Packet> packet) {
 }
 
 void BaseChannel::Send(std::queue<std::unique_ptr<Packet>>* pkts_to_send) {
-  pkt_buffer_.Push(pkts_to_send);
+  std::queue<std::unique_ptr<Packet>> pkts;
+  uint32 size = pkts_to_send->size();
+  for (uint32 i = 0; i < size; i++) {
+    // if (pkts_to_send->front()->tcp_header().seq_num == 10) {
+    //   if (error_indexer == 0) {
+    //     // Drop the packet.
+    //     pkts_to_send->pop();
+    //     error_indexer++;
+    //     continue;
+    //   }
+    // }
+
+    // Simulate an unreliable channel: roll a dice and drop the packet.
+    if (Utils::RandomFloat() < kPacketLossRatio) {
+      printf("*Dropping packet %d\n",
+             pkts_to_send->front()->tcp_header().seq_num);
+      pkts_to_send->pop();
+      continue;
+    }
+
+    if (Utils::RandomFloat() < kPacketCorruptRatio) {
+      printf("*Corrupting packet %d\n",
+             pkts_to_send->front()->tcp_header().seq_num);
+      pkts_to_send->front()->set_corrupted(true);
+    }
+
+    pkts.push(std::move(pkts_to_send->front()));
+    pkts_to_send->pop();
+  }
+
+  pkt_buffer_.Push(&pkts);
 }
 
 void BaseChannel::Send(Packet* packet) {

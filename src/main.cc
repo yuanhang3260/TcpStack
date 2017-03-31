@@ -18,7 +18,7 @@ const uint32 kBobPort = 20;
 const uint32 kAliceSocket = 5;
 const uint32 kBobSocket = 5;
 
-const uint32 kTestDataSize = 30;
+const uint32 kTestDataSize = 300;
 byte* data;
 byte* receive_buffer;
 

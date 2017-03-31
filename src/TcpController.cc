@@ -30,8 +30,10 @@ TcpController::TcpController(Host* host,
     recv_buffer_(options.recv_buffer_size),
     send_buffer_(options.send_buffer_size),
     send_window_(options.send_window_base, options.send_window_size),
-    timer_(std::chrono::seconds(1),
+    timer_(std::chrono::milliseconds(2 * 100),
            std::bind(&TcpController::TimeoutReTransmitter, this)) {
+  timer_.SetRepeat(true);
+
   thread_pool_.AddTask(
       std::bind(&TcpController::PacketReceiveBufferListner, this));
   thread_pool_.AddTask(
@@ -215,6 +217,10 @@ void TcpController::SocketSendBufferListener() {
 }
 
 void TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
+  if (!pkt) {
+    return;
+  }
+
   std::string debug_msg = pkt->tcp_header().ack ?
       "ack " + std::to_string(pkt->tcp_header().ack_num) :
       "send " + std::to_string(pkt->tcp_header().seq_num);

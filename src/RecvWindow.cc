@@ -17,6 +17,12 @@ RecvWindow::RecvWindow(uint32 recv_base, uint32 capacity) :
 
 std::pair<uint32, std::shared_ptr<RecvWindow::RecvWindowNode>>
 RecvWindow::ReceivePacket(std::unique_ptr<Packet> new_pkt) {
+  // Received a already acked data packet. It may be due to ack loss/corruption.
+  // Re-ack recv_base.
+  if (new_pkt->tcp_header().seq_num < recv_base_) {
+    return std::make_pair(recv_base_, nullptr); 
+  }
+
   // Create a new node and insert it to the proper position of queue.
   std::shared_ptr<RecvWindowNode> new_node(new RecvWindowNode());
   new_node->pkt.reset(new_pkt.release());

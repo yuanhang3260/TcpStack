@@ -4,6 +4,7 @@
 #include <string>
 
 #include "Base/BaseTypes.h"
+#include "Base/MacroUtils.h"
 #include "IPHeader.h"
 #include "TcpHeader.h"
 #include "Utility/BufferInterface.h"
@@ -37,11 +38,16 @@ class Packet {
   uint32 InjectPayloadFromBuffer(Utility::BufferInterface* src_buffer,
                                  uint32 size);
 
+  DEFINE_ACCESSOR(corrupted, bool);
+
  private:
   IPHeader ip_header_;
   TcpHeader tcp_header_;
   byte* payload_ = nullptr;
   uint32 payload_size_ = 0;
+
+  // A simple way to mark this packet has been corrupted.
+  bool corrupted_ = false;
 };
 
 }  // namespace net_stack

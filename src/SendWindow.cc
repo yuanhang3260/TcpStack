@@ -5,7 +5,8 @@
 namespace net_stack {
 
 namespace {
-uint32 kMaxDuplicatedAcks = 2;
+uint32 kMaxDuplicatedAcksOrigin = 2;
+uint32 max_duplicated_acks = kMaxDuplicatedAcksOrigin;
 }
 
 SendWindow::SendWindow(uint32 send_base) :
@@ -96,11 +97,15 @@ bool SendWindow::NewAckedPacket(uint32 ack_num) {
     send_base_ = ack_num;
     last_acked_num_ = ack_num;
     duplicated_acks_ = 0;
+    max_duplicated_acks = kMaxDuplicatedAcksOrigin;
     return false;
   } else if (ack_num == send_base_) {
     duplicated_acks_++;
-    if (duplicated_acks_ >= kMaxDuplicatedAcks) {
+    if (duplicated_acks_ >= max_duplicated_acks) {
       duplicated_acks_ = 0;
+      // Increase duplicated acks torlerance by factor of 1.5 to avoid too many
+      // *duplicated* re-transmission.
+      max_duplicated_acks *= 1.5;
       return true;
     }
     return false;
