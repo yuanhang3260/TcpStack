@@ -20,7 +20,7 @@ SendWindow::SendWindow(uint32 send_base, uint32 capacity) :
 }
 
 bool SendWindow::SendPacket(std::shared_ptr<Packet> new_pkt) {
-  if (free_space() < new_pkt->payload_size()) {
+  if (free_space() < new_pkt->payload_size() && capacity_ > 0) {
     LogERROR("Can't send new packet - not enough window size");
     return false;
   }
@@ -54,13 +54,15 @@ bool SendWindow::SendPacket(std::shared_ptr<Packet> new_pkt) {
 
 bool SendWindow::NewAckedPacket(uint32 ack_num) {
   // Do a sanity check : Is the ack_num within send window?
-  if (send_base_ < send_base_ + capacity_ &&
+  if (capacity_ > 0 &&
+      send_base_ < send_base_ + capacity_ &&
       (ack_num < send_base_ || ack_num > send_base_ + capacity_)) {
     LogERROR("ack_num %d out of window [%d, %d)",
              ack_num, send_base_, send_base_ + capacity_);
     return false;
   }
-  if (send_base_ >= send_base_ + capacity_ &&
+  if (capacity_ > 0 &&
+      send_base_ >= send_base_ + capacity_ &&
       (ack_num < send_base_ && ack_num > send_base_ + capacity_)) {
     LogERROR("ack_num %d out of overflow window [%d, %d)",
              ack_num, send_base_, send_base_ + capacity_);
@@ -124,6 +126,14 @@ std::unique_ptr<Packet> SendWindow::BasePakcketWaitingForAck() const {
 
 uint32 SendWindow::NextSeqNumberToSend() const {
   return send_base_ + size_;
+}
+
+uint32 SendWindow::free_space() const {
+  if (capacity_ > size_) {
+    return capacity_ - size_;
+  }
+
+  return 0;
 }
 
 }  // namespace net_stack

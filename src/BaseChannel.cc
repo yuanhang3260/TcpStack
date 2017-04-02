@@ -1,3 +1,4 @@
+#include <unistd.h>
 #include <string>
 
 #include "Base/Log.h"
@@ -10,8 +11,10 @@ namespace {
 
 //uint32 error_indexer = 0;
 
-const double kPacketLossRatio = 0.2;
+const double kPacketLossRatio = 0;
 const double kPacketCorruptRatio = 0;
+
+const uint32 kChannelDelayMicroSeconds = 2 * 10 * 1000;
 
 }  // namespace
 
@@ -39,6 +42,8 @@ void BaseChannel::Send(std::unique_ptr<Packet> packet) {
 }
 
 void BaseChannel::Send(std::queue<std::unique_ptr<Packet>>* pkts_to_send) {
+  usleep(kChannelDelayMicroSeconds);
+
   std::queue<std::unique_ptr<Packet>> pkts;
   uint32 size = pkts_to_send->size();
   for (uint32 i = 0; i < size; i++) {

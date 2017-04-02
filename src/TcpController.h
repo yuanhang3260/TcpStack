@@ -13,7 +13,8 @@
 #include "PacketQueue.h"
 #include "RecvWindow.h"
 #include "SendWindow.h"
-#include "Utility/InfiniteBuffer.h"
+#include "Utility/RingBuffer.h"
+#include "Utility/RingBuffer.h"
 #include "Utility/ThreadPool.h"
 #include "Utility/Timer.h"
 
@@ -92,7 +93,12 @@ class TcpController {
   // These method serve down-link packet/data delivery (send data).
   void SocketSendBufferListener();
   void SendPacket(std::unique_ptr<Packet> pkt);
-  void PacketSendBufferListner();
+  void PacketSendBufferListener();
+
+  // Socket receive buffer listner. It waits for socket receive buffer to
+  // become non-empty, and push overflowed packets into it.
+  void SocketReceiveBufferListener();
+  void PushOverflowedPacketsToSocketBuffer();
 
   // Timeout callback.
   void TimeoutReTransmitter();
@@ -120,13 +126,19 @@ class TcpController {
   // use it.
   RecvWindow recv_window_;
   // Socket receive buffer.
-  Utility::InfiniteBuffer recv_buffer_;
+  Utility::RingBuffer recv_buffer_;
   std::mutex recv_buffer_mutex_;
-  std::condition_variable recv_buffer_cv_;
+  std::condition_variable recv_buffer_read_cv_;
+  std::condition_variable recv_buffer_write_cv_;
+  // This is a temporary queue to store overflowed packets when socket receive
+  // buffer is full. This is for a corner case of flow control. When receive
+  // window size is 0, sender will continue sending packets with size 1 byte.
+  std::queue<std::shared_ptr<Packet>> overflow_pkts_;
+  std::mutex overflow_pkts_mutex_;
 
   // *************** Send Pipeline **************** //
   // Socket send buffer.
-  Utility::InfiniteBuffer send_buffer_;
+  Utility::RingBuffer send_buffer_;
   std::mutex send_buffer_mutex_;
   std::condition_variable send_buffer_cv_;
   std::condition_variable send_buffer_write_cv_;

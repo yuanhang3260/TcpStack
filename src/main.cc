@@ -18,7 +18,7 @@ const uint32 kBobPort = 20;
 const uint32 kAliceSocket = 5;
 const uint32 kBobSocket = 5;
 
-const uint32 kTestDataSize = 300;
+const uint32 kTestDataSize = 500;
 byte* data;
 byte* receive_buffer;
 
@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
       if (re > 0) {
         readn += re;
       }
-      //printf("readn = %d\n", readn);
+      printf("readn = %d\n", readn);
     }
     if (readn != kTestDataSize) {
       LogERROR("Bob received %d bytes data\n", readn);
@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
     if (!ReceivedDataCorrect()) {
       LogERROR("Receive data failed");
     } else {
-      printf("Bob received correct data :)\n");
+      printf("Bob received correct data \033[2;32m:)\033[0m\n");
     }
   };
 
