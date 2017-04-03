@@ -29,6 +29,7 @@ class RecvWindow : public TcpWindow {
   ReceivePacket(std::unique_ptr<Packet> new_pkt);
 
   uint32 capacity() const { return capacity_; }
+  uint32 recv_base() const { return recv_base_; }
 
  private:
   // Receive base. This is the next seq number expected to receive.

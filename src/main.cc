@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
       if (re > 0) {
         readn += re;
       }
-      printf("readn = %d\n", readn);
+      //printf("readn = %d\n", readn);
     }
     if (readn != kTestDataSize) {
       LogERROR("Bob received %d bytes data\n", readn);

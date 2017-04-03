@@ -56,7 +56,7 @@ bool SendWindow::NewAckedPacket(uint32 ack_num) {
   // Do a sanity check : Is the ack_num within send window?
   if (capacity_ > 0 &&
       send_base_ < send_base_ + capacity_ &&
-      (ack_num < send_base_ || ack_num > send_base_ + capacity_)) {
+      (ack_num < send_base_ /*|| ack_num > send_base_ + capacity_ */)) {
     LogERROR("ack_num %d out of window [%d, %d)",
              ack_num, send_base_, send_base_ + capacity_);
     return false;

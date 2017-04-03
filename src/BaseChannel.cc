@@ -11,10 +11,10 @@ namespace {
 
 //uint32 error_indexer = 0;
 
-const double kPacketLossRatio = 0;
+const double kPacketLossRatio = 0.1;
 const double kPacketCorruptRatio = 0;
 
-const uint32 kChannelDelayMicroSeconds = 2 * 10 * 1000;
+const uint32 kChannelDelayMicroSeconds = 1 * 20 * 1000;
 
 }  // namespace
 

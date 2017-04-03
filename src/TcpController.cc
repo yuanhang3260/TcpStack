@@ -32,7 +32,7 @@ TcpController::TcpController(Host* host,
     recv_buffer_(options.recv_buffer_size),
     send_buffer_(options.send_buffer_size),
     send_window_(options.send_window_base, options.send_window_size),
-    timer_(std::chrono::milliseconds(7 * 100),
+    timer_(std::chrono::milliseconds(5 * 100),
            std::bind(&TcpController::TimeoutReTransmitter, this)) {
   timer_.SetRepeat(true);
 
@@ -112,6 +112,13 @@ void TcpController::HandleReceivedPackets(
         send_window_cv_.notify_one();
       }
     } else {
+      if (pkt->payload_size() == 0) {
+        // This is a zero-size data packet. Sender is probing receive window
+        // size.
+        SendPacket(std::move(MakeAckPacket(recv_window_.recv_base())));
+        continue;
+      }
+
       // Handle data packet. Deliver packets to upper layer (socket receive
       // buffer) if avaible, and sends ack packet back to sender.
       auto pair = recv_window_.ReceivePacket(std::move(pkt));
@@ -138,8 +145,9 @@ void TcpController::StreamDataToReceiveBuffer(
         uint32 writen =
             recv_buffer_.Write(node->pkt->payload(), node->pkt->payload_size());
         if (writen <= 0) {
-          // LogERROR("Socket receive buffer is full, pkt seq = %u is dropped.",
-          //          node->pkt->tcp_header().seq_num);
+          LogFATAL("Socket receive buffer is full, pkt seq = %u is dropped.",
+                   node->pkt->tcp_header().seq_num);
+          // LogFATAL("hehe");
 
           overflow_pkts_.push(node->pkt);
         }
@@ -241,7 +249,24 @@ void TcpController::SocketSendBufferListener() {
     // Create data packets and send them out.
     uint32 size_to_send = 0;
     if (send_window_.capacity() == 0) {
-      size_to_send = 1;
+      // Send a packet with size = 0, and continue to check if send window has
+      // capacity and space. Don't repeatedly send lots of one-byte packets.
+      size_to_send = 0;
+      // bool restart_timer = (send_window_.NumPacketsToAck() == 0);
+
+      auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
+                                         &send_buffer_, size_to_send);
+      // This just mark the new pkt into send window.
+      // if (!send_window_.SendPacket(new_data_pkt)) {
+      //   continue;
+      // }
+      // Really send the packet.
+      SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
+      // if (restart_timer) {
+      //   timer_.Restart();
+      // }
+      //send_buffer_write_cv_.notify_one();
+      continue;
     } else {
       size_to_send = Utils::Min(send_window_.free_space(), send_buffer_.size());
     }
@@ -288,7 +313,8 @@ void TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
 
   std::string debug_msg = pkt->tcp_header().ack ?
       "ack " + std::to_string(pkt->tcp_header().ack_num) :
-      "send " + std::to_string(pkt->tcp_header().seq_num);
+      "send " + std::to_string(pkt->tcp_header().seq_num)
+              + ", size = " + std::to_string(pkt->payload_size());
   debuginfo(debug_msg);
 
   pkt_send_buffer_.Push(std::move(pkt));
