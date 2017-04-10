@@ -43,6 +43,8 @@ class Packet {
   uint32 InjectPayloadFromBuffer(Utility::BufferInterface* src_buffer,
                                  uint32 size);
 
+  std::string DebugString() const;
+
   DEFINE_ACCESSOR(corrupted, bool);
 
  private:

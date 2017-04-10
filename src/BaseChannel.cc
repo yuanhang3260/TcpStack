@@ -11,7 +11,7 @@ namespace {
 
 //uint32 error_indexer = 0;
 
-const double kPacketLossRatio = 0.0;
+const double kPacketLossRatio = 0.1;
 const double kPacketCorruptRatio = 0;
 
 const uint32 kChannelDelayMicroSeconds = 1 * 20 * 1000;
@@ -58,15 +58,15 @@ void BaseChannel::Send(std::queue<std::unique_ptr<Packet>>* pkts_to_send) {
 
     // Simulate an unreliable channel: roll a dice and drop the packet.
     if (Utils::RandomFloat() < kPacketLossRatio) {
-      printf("*Dropping packet %d\n",
-             pkts_to_send->front()->tcp_header().seq_num);
+      printf("*Dropping packet %s\n",
+             pkts_to_send->front()->DebugString().c_str());
       pkts_to_send->pop();
       continue;
     }
 
     if (Utils::RandomFloat() < kPacketCorruptRatio) {
-      printf("*Corrupting packet %d\n",
-             pkts_to_send->front()->tcp_header().seq_num);
+      printf("*Corrupting packet %s\n",
+             pkts_to_send->front()->DebugString().c_str());
       pkts_to_send->front()->set_corrupted(true);
     }
 

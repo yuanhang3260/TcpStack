@@ -107,9 +107,10 @@ bool Host::HandleNewConnection(const Packet& pkt) {
   connections_.emplace(tcp_key,
                        ptr::MakeUnique<TcpController>(
                           this, tcp_key, new_fd, tcp_options));
-
-  std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
-  socket_tcp_map_.emplace(new_fd, connections_.at(tcp_key).get());
+  {
+    std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
+    socket_tcp_map_.emplace(new_fd, connections_.at(tcp_key).get());
+  }
 
   // Notify Accept() to get the a new TCP connection socket.
   std::unique_lock<std::mutex> listener_lock(listener->mutex);
@@ -259,8 +260,13 @@ bool Host::Connect(int32 sock_fd,
   tcp_options.send_window_base = 0;  /* Utils::RandomNumber(); */
   connections_.emplace(tcp_key,
                        ptr::MakeUnique<TcpController>(
-                          this, tcp_key, sock_fd,tcp_options));
+                          this, tcp_key, sock_fd, tcp_options));
   auto tcp_con = connections_.at(tcp_key).get();
+
+  {
+    std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
+    socket_tcp_map_.emplace(sock_fd, tcp_con);
+  }
 
   // Clean up steps.
   auto clean_up = Utility::CleanUp([&]() {

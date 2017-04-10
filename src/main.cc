@@ -88,17 +88,43 @@ int main(int argc, char** argv) {
     }
 
     // Begin sending data to server.
-    // uint32 writen = 0;
-    // while (writen < kTestDataSize) {
-    //   auto re = alice.WriteData(sock_fd,
-    //                             data + writen, kTestDataSize - writen);
-    //   if (re > 0) {
-    //     writen += re;
-    //   }
-    // }
-    // if (writen != kTestDataSize) {
-    //   LogERROR("Alice sent %d bytes data\n", writen);
-    // }
+    uint32 writen = 0;
+    while (writen < kTestDataSize) {
+      auto re = alice.WriteData(sock_fd,
+                                data + writen, kTestDataSize - writen);
+      if (re > 0) {
+        writen += re;
+      }
+    }
+    if (writen != kTestDataSize) {
+      LogERROR("Alice sent %d bytes data\n", writen);
+    }
+
+    // Receive data from server, verify bytes are flipped.
+    uint32 readn = 0;
+    byte client_buffer[kTestDataSize];
+    while (readn < kTestDataSize) {
+      auto re = alice.ReadData(sock_fd, client_buffer + readn, kTestDataSize);
+      if (re > 0) {
+        readn += re;
+      }
+      //printf("readn = %d\n", readn);
+    }
+    if (readn != kTestDataSize) {
+      LogERROR("Alice received %d bytes data\n", readn);
+      return;
+    }
+    bool flip_correct = true;
+    for (uint32 i = 0; i < kTestDataSize; i++) {
+      if (client_buffer[i] != 256 - data[i]) {
+        LogERROR("Alice received back wrong data!");
+        flip_correct = false;
+        break;
+      }
+    }
+    if (flip_correct) {
+      printf("Alice received correct data \033[2;32m:)\033[0m\n");
+    }
   };
 
   auto bob_thread = [&] () {
@@ -125,32 +151,50 @@ int main(int argc, char** argv) {
     }
 
     // Server start accepting new connections.
+    int tcp_socket = -1;
     while (true) {
-      int new_fd = bob.Accept(sock_fd);
-      if (new_fd < 0) {
+      tcp_socket = bob.Accept(sock_fd);
+      if (tcp_socket < 0) {
         LogERROR("Accept failed");
         continue;
       }
       break;
     }
 
-    // uint32 readn = 0;
-    // while (readn < kTestDataSize) {
-    //   auto re = bob.ReadData(kBobSocket, receive_buffer + readn, kTestDataSize);
-    //   if (re > 0) {
-    //     readn += re;
-    //   }
-    //   //printf("readn = %d\n", readn);
-    // }
-    // if (readn != kTestDataSize) {
-    //   LogERROR("Bob received %d bytes data\n", readn);
-    //   return;
-    // }
-    // if (!ReceivedDataCorrect()) {
-    //   LogERROR("Receive data failed");
-    // } else {
-    //   printf("Bob received correct data \033[2;32m:)\033[0m\n");
-    // }
+    uint32 readn = 0;
+    while (readn < kTestDataSize) {
+      auto re = bob.ReadData(tcp_socket, receive_buffer + readn, kTestDataSize);
+      if (re > 0) {
+        readn += re;
+      }
+      //printf("readn = %d\n", readn);
+    }
+    if (readn != kTestDataSize) {
+      LogERROR("Bob received %d bytes data\n", readn);
+      return;
+    }
+    if (!ReceivedDataCorrect()) {
+      LogERROR("Receive data failed");
+    } else {
+      printf("Bob received correct data \033[2;32m:)\033[0m\n");
+    }
+
+    // Service: Flip each byte and send back to client.
+    for (uint32 i = 0; i < kTestDataSize; i++) {
+      receive_buffer[i] = 256 - receive_buffer[i];
+    }
+
+    uint32 writen = 0;
+    while (writen < kTestDataSize) {
+      auto re = bob.WriteData(tcp_socket,
+                              receive_buffer + writen, kTestDataSize - writen);
+      if (re > 0) {
+        writen += re;
+      }
+    }
+    if (writen != kTestDataSize) {
+      LogERROR("Bob sent %d bytes data\n", writen);
+    }
   };
 
   FixedThreadPool thread_pool(2);
