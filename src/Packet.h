@@ -28,11 +28,16 @@ class Packet {
 
   Packet* Copy() const;
 
-  const IPHeader& ip_header() { return ip_header_; }
-  const TcpHeader& tcp_header() { return tcp_header_; }
-  const byte* payload() { return payload_; }
+  const IPHeader& ip_header() const { return ip_header_; }
+  IPHeader* mutable_ip_header() { return &ip_header_; }
+
+  const TcpHeader& tcp_header() const { return tcp_header_; }
+  TcpHeader* mutable_tcp_header() { return &tcp_header_; }
+
+  const byte* payload() const { return payload_; }
   byte* mutable_payload() { return payload_; }
-  uint32 payload_size() { return payload_size_; }
+  uint32 payload_size() const { return payload_size_; }
+  void set_payload_size(uint32 size)  { payload_size_ = size; }
 
   uint32 InjectPayload(const byte* payload, int size);
   uint32 InjectPayloadFromBuffer(Utility::BufferInterface* src_buffer,

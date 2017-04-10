@@ -61,44 +61,96 @@ int main(int argc, char** argv) {
   channel_alice_to_bob.Start();
   channel_bob_to_alice.Start();
 
-  alice.CreateTcpConnection(kBobIP, kBobPort, kAlicePort, kAliceSocket);
-  bob.CreateTcpConnection(kAliceIP, kAlicePort, kBobPort, kBobSocket);
-
   // Create data to send.
   InitData();
 
   auto alice_thread = [&] () {
-    uint32 writen = 0;
-    while (writen < kTestDataSize) {
-      auto re = alice.WriteData(kAliceSocket, data + writen,
-                                kTestDataSize - writen);
-      if (re > 0) {
-        writen += re;
-      }
+    // Create client socket.
+    int sock_fd = alice.Socket();
+    if (sock_fd < 0) {
+      LogERROR("Failed to create client socket");
+      return;
     }
-    if (writen != kTestDataSize) {
-      LogERROR("Alice sent %d bytes data\n", writen);
+
+    // Bind to static port.
+    bool re = alice.Bind(sock_fd, kAliceIP, kAlicePort);
+    if (!re) {
+      LogERROR("Failed to bind socket %d to {%s, %u}",
+               sock_fd, kAliceIP, kAlicePort);
+      return;
     }
+
+    // Connect server.
+    re = alice.Connect(sock_fd, kBobIP, kBobPort);
+    if (!re) {
+      LogERROR("Client Alice failed to connect to server Bob");
+      return;
+    }
+
+    // Begin sending data to server.
+    // uint32 writen = 0;
+    // while (writen < kTestDataSize) {
+    //   auto re = alice.WriteData(sock_fd,
+    //                             data + writen, kTestDataSize - writen);
+    //   if (re > 0) {
+    //     writen += re;
+    //   }
+    // }
+    // if (writen != kTestDataSize) {
+    //   LogERROR("Alice sent %d bytes data\n", writen);
+    // }
   };
 
   auto bob_thread = [&] () {
-    uint32 readn = 0;
-    while (readn < kTestDataSize) {
-      auto re = bob.ReadData(kBobSocket, receive_buffer + readn, kTestDataSize);
-      if (re > 0) {
-        readn += re;
-      }
-      //printf("readn = %d\n", readn);
-    }
-    if (readn != kTestDataSize) {
-      LogERROR("Bob received %d bytes data\n", readn);
+    // Create server socket.
+    int sock_fd = bob.Socket();
+    if (sock_fd < 0) {
+      LogERROR("Failed to create server socket");
       return;
     }
-    if (!ReceivedDataCorrect()) {
-      LogERROR("Receive data failed");
-    } else {
-      printf("Bob received correct data \033[2;32m:)\033[0m\n");
+
+    // Bind socket to listning port.
+    bool re = bob.Bind(sock_fd, kBobIP, kBobPort);
+    if (!re) {
+      LogERROR("Failed to bind socket %d to {%s, %u}",
+               sock_fd, kBobIP, kBobPort);
+      return;
     }
+
+    // Listen on this socket.
+    re = bob.Listen(sock_fd);
+    if (!re) {
+      LogERROR("Failed to listen on socket %d", sock_fd);
+      return;
+    }
+
+    // Server start accepting new connections.
+    while (true) {
+      int new_fd = bob.Accept(sock_fd);
+      if (new_fd < 0) {
+        LogERROR("Accept failed");
+        continue;
+      }
+      break;
+    }
+
+    // uint32 readn = 0;
+    // while (readn < kTestDataSize) {
+    //   auto re = bob.ReadData(kBobSocket, receive_buffer + readn, kTestDataSize);
+    //   if (re > 0) {
+    //     readn += re;
+    //   }
+    //   //printf("readn = %d\n", readn);
+    // }
+    // if (readn != kTestDataSize) {
+    //   LogERROR("Bob received %d bytes data\n", readn);
+    //   return;
+    // }
+    // if (!ReceivedDataCorrect()) {
+    //   LogERROR("Receive data failed");
+    // } else {
+    //   printf("Bob received correct data \033[2;32m:)\033[0m\n");
+    // }
   };
 
   FixedThreadPool thread_pool(2);

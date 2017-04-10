@@ -28,8 +28,9 @@ class RecvWindow : public TcpWindow {
   std::pair<uint32, std::shared_ptr<RecvWindowNode>>
   ReceivePacket(std::unique_ptr<Packet> new_pkt);
 
+  DEFINE_ACCESSOR(recv_base, uint32);
+
   uint32 capacity() const { return capacity_; }
-  uint32 recv_base() const { return recv_base_; }
 
  private:
   // Receive base. This is the next seq number expected to receive.

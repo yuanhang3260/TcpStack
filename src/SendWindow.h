@@ -25,9 +25,10 @@ class SendWindow : public TcpWindow {
   bool NewAckedPacket(uint32 ack_num);
 
   DEFINE_ACCESSOR(capacity, uint32);
+  DEFINE_ACCESSOR(send_base, uint32);
+
   uint32 size() const { return size_; }
   uint32 free_space() const;
-  uint32 send_base() const { return send_base_; }
 
   uint32 NumPacketsToAck() const { return pkts_to_ack_.size(); }
 

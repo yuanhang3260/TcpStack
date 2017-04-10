@@ -13,6 +13,7 @@
 #include "PacketQueue.h"
 #include "RecvWindow.h"
 #include "SendWindow.h"
+#include "Strings/Utils.h"
 #include "Utility/RingBuffer.h"
 #include "Utility/RingBuffer.h"
 #include "Utility/ThreadPool.h"
@@ -52,8 +53,34 @@ struct TcpControllerKey {
   }
 
   std::string DebugString() const {
-    return "{" + source_ip + ", " + std::to_string(source_port) + ", " +
-           dest_ip + ", " + std::to_string(dest_port) + "}";
+    return Strings::StrCat("{", source_ip, ", ", std::to_string(source_port),
+                           ", ", dest_ip, ", ", std::to_string(dest_port), "}");
+  }
+};
+
+// Local listener key. It only bundles {local ip, local_port} as key.
+struct LocalLayerThreeKey {
+  std::string local_ip;
+  uint32 local_port;
+
+  bool operator==(const LocalLayerThreeKey &other) const { 
+    return local_ip == other.local_ip && local_port == other.local_port;
+  }
+
+  bool operator<(const LocalLayerThreeKey &other) const {
+    if (local_ip != other.local_ip) {
+      return local_ip < other.local_ip;
+    }
+    if (local_port != other.local_port) {
+      return local_port < other.local_port;
+    }
+
+    return false;
+  }
+
+  std::string DebugString() const {
+    return Strings::StrCat("{", local_ip, ", ",
+                           std::to_string(local_port), "}");
   }
 };
 
@@ -70,7 +97,15 @@ struct TcpControllerOptions {
 // TcpController is completely event-driven. It has monitors for all 
 class TcpController {
  public:
-  TcpController(Host* host, const TcpControllerKey& tcp_id, uint32 socket_fd,
+  enum TCP_STATE {
+    CLOSED,
+    SYN_SENT,
+    ESTABLISHED,
+    LISTEN,
+    SYN_RCVD,
+  };
+
+  TcpController(Host* host, const TcpControllerKey& tcp_id, int32 socket_fd,
                 const TcpControllerOptions& options);
   ~TcpController();
 
@@ -82,6 +117,9 @@ class TcpController {
   // This is the actual streaming API for application layer to call. 
   int32 ReadData(byte* buf, int32 size);
   int32 WriteData(const byte* buf, int32 size);
+
+  // Connect to remote host. It sends a SYNC segment.
+  bool TryConnect();
 
  private:
   // These methods serve uplink packet/data delivery (receive data).
@@ -110,11 +148,13 @@ class TcpController {
   
   std::unique_ptr<Packet> MakeAckPacket(uint32 ack_num);
 
+  std::shared_ptr<Packet> MakeSyncPacket(uint32 seq_num);
+
   void debuginfo(const std::string& msg);
 
   Host* host_ = nullptr;
   TcpControllerKey key_;
-  uint32 socket_fd_;
+  int32 socket_fd_;
 
   Executors::FixedThreadPool thread_pool_;
 
@@ -152,6 +192,11 @@ class TcpController {
 
   // Timer
   Utility::Timer timer_;
+
+  // TCP state.
+  TCP_STATE state_ = CLOSED;
+  std::mutex state_mutex_;
+  std::condition_variable state_cv_;
 };
 
 }  // namespace net_stack
@@ -169,6 +214,17 @@ struct hash<net_stack::TcpControllerKey> {
                (int_hasher(tcp_id.dest_port) << 2)) >> 2);
   }
 };
+
+template <>
+struct hash<net_stack::LocalLayerThreeKey> {
+  size_t operator() (const net_stack::LocalLayerThreeKey& id) const {
+    std::hash<std::string> str_hasher;
+    std::hash<int> int_hasher;
+      return ((str_hasher(id.local_ip) ^
+              (int_hasher(id.local_port) << 1)) >> 1);
+  }
+};
+
 }  // namespace
 
 #endif  // NET_STACK_TCP_CONTROLLER_

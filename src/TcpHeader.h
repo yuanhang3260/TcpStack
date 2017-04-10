@@ -14,6 +14,9 @@ struct TcpHeader {
   bool ack = false;
   uint16 window_size = 0;
   uint16 check_sum = 0;
+  bool sync = false;
+  bool fin = false;
+  bool rst = false;
 };
 
 }  // namespace net_stack

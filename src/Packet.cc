@@ -34,6 +34,10 @@ Packet::~Packet() {
 }
 
 uint32 Packet::InjectPayload(const byte* data, int size) {
+  if (!data || size <= 0) {
+    return 0;
+  }
+
   if (payload_) {
     delete[] payload_;
   }
@@ -61,6 +65,8 @@ uint32 Packet::InjectPayloadFromBuffer(
 
 Packet* Packet::Copy() const {
   Packet* copy = new Packet(ip_header_, tcp_header_);
+  copy->payload_size_ = payload_size_;
+
   copy->InjectPayload(payload_, payload_size_);
   return copy;
 }

@@ -13,7 +13,7 @@ uint32 kThreadPoolSize = 4;
 
 uint32 kDefaultDataPacketSize = 10;
 
-uint32 kMaxWindowSize = 65536;
+//uint32 kMaxWindowSize = 65536;
 
 uint32 kDefaultWindowBase = 0;
 uint32 kDefaultWindowSize = 100;
@@ -22,7 +22,7 @@ uint32 kDefaultSocketBufferSize = 100;
 
 TcpController::TcpController(Host* host,
                              const TcpControllerKey& tcp_key,
-                             uint32 socket_fd,
+                             int32 socket_fd,
                              const TcpControllerOptions& options) :
     host_(host),
     key_(tcp_key),
@@ -34,6 +34,8 @@ TcpController::TcpController(Host* host,
     send_window_(options.send_window_base, options.send_window_size),
     timer_(std::chrono::milliseconds(5 * 100),
            std::bind(&TcpController::TimeoutReTransmitter, this)) {
+  state_ = CLOSED;
+
   timer_.SetRepeat(true);
 
   thread_pool_.AddTask(
@@ -63,6 +65,41 @@ TcpController::~TcpController() {
   thread_pool_.AwaitTermination();
 }
 
+bool TcpController::TryConnect() {
+  {
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    if (state_ != CLOSED) {
+      LogERROR("TCP state is not CLOSED, can't Connect");
+      return false;
+    }
+  }
+
+  auto sync_pkt = MakeSyncPacket(send_window_.send_base());
+
+  {
+    std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
+    if (!send_window_.SendPacket(sync_pkt)) {
+      LogERROR("Failed to send sync packet");
+      return false;
+    }
+  }
+
+  timer_.Restart();
+
+  // Send the sync packet (1st handshake), and wait for remote host's
+  // SYNC_ACK segment (2nd handshake).
+  //
+  // Here we simply wait for TCP state transitted to ESTABLISHED.
+  SendPacket(std::unique_ptr<Packet>(sync_pkt->Copy()));
+  {
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    state_ = SYN_SENT;
+    state_cv_.wait(state_lock, [&] { return state_ == ESTABLISHED; });
+  }
+
+  return true;
+}
+
 // This method just enqueue the new packets into this TCP connection's private
 // packet receive buffer. It is PacketReceiveBufferListner that monitors this
 // queue and handles packets.
@@ -88,7 +125,84 @@ void TcpController::HandleReceivedPackets(
     std::unique_ptr<Packet> pkt = std::move(new_packets->front());
     new_packets->pop();
 
-    if (pkt->tcp_header().ack) {
+    // SYNC segment (1st handshake) from client
+    //
+    // Client is trying to establish connection. Send a SYNC_ACK segment back.
+    if (pkt->tcp_header().sync && !pkt->tcp_header().ack) {
+      debuginfo("sync " + std::to_string(pkt->tcp_header().seq_num));
+      // Receive window's recv base has already been intialized as client's
+      // seq_num. Now it should increment by 1 to client_seq_num + 1.
+      uint32 client_seq_num = pkt->tcp_header().seq_num;
+      auto pair = recv_window_.ReceivePacket(std::move(pkt));
+      SANITY_CHECK(pair.first == client_seq_num + 1,
+                   "Server's recv_base should be client_seq_num + 1 = %u, "
+                   "but actually it's %u",
+                   client_seq_num + 1, pair.first);
+
+      // Send back a SYNC_ACK packet, with a randomly generated server_seq_num,
+      // and ack clients SYNC packet with ack_num = client_seq_num + 1.
+      uint32 server_seq_num = 0; /* Utils::RandomNumber(); */
+      auto sync_ack_pkt = MakeSyncPacket(server_seq_num);
+      sync_ack_pkt->mutable_tcp_header()->ack = true;
+      sync_ack_pkt->mutable_tcp_header()->ack_num = pair.first;
+      {
+        // This SYNC_ACK packet contains server's receive window size so that
+        // client can init its flow control before sending any data packet.
+        std::unique_lock<std::mutex> recv_buffer_lock(recv_buffer_mutex_);
+        sync_ack_pkt->mutable_tcp_header()
+                        ->window_size = recv_buffer_.free_space();
+      }
+
+      // SYNC_ACK packet is firstly a SYNC packet. It needs to be recorded in
+      // send window.
+      {
+        std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
+        if (!send_window_.SendPacket(sync_ack_pkt)) {
+          LogERROR("Failed to send SYNC_ACK packet");
+          continue;
+        }
+      }
+
+      SendPacket(std::unique_ptr<Packet>(sync_ack_pkt->Copy()));
+
+      {
+        std::unique_lock<std::mutex> state_lock(state_mutex_);
+        state_ = SYN_RCVD;
+      }
+
+      // Wait for client's ack packet (3rd handshake). It should be a normal
+      // ack segment sent from client with ack_num = server_seq_num + 1.
+
+    } else if (pkt->tcp_header().sync && pkt->tcp_header().ack) {
+      // SYNC_ACK segment (2nd handshake) from server
+      //
+      // Client handles ack part. After this, client's send base should
+      // increment by one, and send windows size is also synced with server's
+      // receive buffer size. It is now ready to send data packets.
+      {
+        std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
+        send_window_.NewAckedPacket(pkt->tcp_header().ack_num);
+        debuginfo("set window_size = " +
+                  std::to_string(pkt->tcp_header().window_size));
+        send_window_.set_capacity(pkt->tcp_header().window_size);
+      }
+
+      // Mark client --> server connection is ready.
+      {
+        std::unique_lock<std::mutex> state_lock(state_mutex_);
+        if (state_ == SYN_SENT) {
+          state_ = ESTABLISHED;
+          debuginfo("Client --> Server connection established ^_^");
+          state_cv_.notify_one();
+        }
+      }
+
+      // Client handles sync part. Client should init its receive window base
+      // as server's seq_num, and ack this segment (3rd handshake).
+      recv_window_.set_recv_base(pkt->tcp_header().seq_num + 1);
+      SendPacket(std::move(MakeAckPacket(pkt->tcp_header().seq_num + 1)));
+
+    } else if (pkt->tcp_header().ack) {
       std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
 
       // Handle ack packet. If detect duplicated ACKs, do a fast re-transmit.
@@ -104,12 +218,25 @@ void TcpController::HandleReceivedPackets(
       }
 
       // Flow control - set send window size as receiver indicated.
-      printf("set window_size = %d\n", pkt->tcp_header().window_size);
+      debuginfo("set window_size = " +
+                std::to_string(pkt->tcp_header().window_size));
       send_window_.set_capacity(pkt->tcp_header().window_size);
 
       // If send window has free space, notify packet send thread.
       if (send_window_.free_space() > 0 || send_window_.capacity() == 0) {
         send_window_cv_.notify_one();
+      }
+      send_window_lock.unlock();
+
+      // If server is waiting for client's 3rd handshake ack segment, now
+      // we can mark server --> client connection is ready.
+      {
+        std::unique_lock<std::mutex> state_lock(state_mutex_);
+        if (state_ == SYN_RCVD) {
+          state_ = ESTABLISHED;
+          debuginfo("Server --> Client connection established ^_^");
+          state_cv_.notify_one();
+        }
       }
     } else {
       if (pkt->payload_size() == 0) {
@@ -141,18 +268,25 @@ void TcpController::StreamDataToReceiveBuffer(
     // push packets into overflowd packets queue.
     std::shared_ptr<RecvWindow::RecvWindowNode> node = received_pkt_nodes;
     while (node) {
-      if (recv_buffer_.free_space() >= node->pkt->payload_size()) {
+      auto pkt = node->pkt;
+
+      // Special segment.
+      if (pkt->tcp_header().sync) {
+        continue;
+      }
+
+      if (recv_buffer_.free_space() >= pkt->payload_size()) {
         uint32 writen =
-            recv_buffer_.Write(node->pkt->payload(), node->pkt->payload_size());
+            recv_buffer_.Write(pkt->payload(), pkt->payload_size());
         if (writen <= 0) {
           LogFATAL("Socket receive buffer is full, pkt seq = %u is dropped.",
-                   node->pkt->tcp_header().seq_num);
+                   pkt->tcp_header().seq_num);
           // LogFATAL("hehe");
 
-          overflow_pkts_.push(node->pkt);
+          overflow_pkts_.push(pkt);
         }
       } else {
-        overflow_pkts_.push(node->pkt);
+        overflow_pkts_.push(pkt);
       }
       node = node->next;
     }
@@ -194,6 +328,14 @@ void TcpController::PushOverflowedPacketsToSocketBuffer() {
 
 // TODO: add support for non-blocking read.
 int32 TcpController::ReadData(byte* buf, int32 size) {
+  // {
+  //   std::unique_lock<std::mutex> lock(state_mutex_);
+  //   if (state_ != ESTABLISHED) {
+  //     LogERROR("TCP connection not established, abort ReadData");
+  //     return -1;
+  //   }
+  // }
+
   std::unique_lock<std::mutex> lock(recv_buffer_mutex_);
   recv_buffer_read_cv_.wait(lock,
       [this] { return !recv_buffer_.empty(); });
@@ -211,6 +353,14 @@ int32 TcpController::ReadData(byte* buf, int32 size) {
 }
 
 int32 TcpController::WriteData(const byte* buf, int32 size) {
+  // {
+  //   std::unique_lock<std::mutex> lock(state_mutex_);
+  //   if (state_ != ESTABLISHED) {
+  //     LogERROR("TCP connection not established, abort WriteData");
+  //     return -1;
+  //   }
+  // }
+
   uint32 writen = 0;
   {
     std::unique_lock<std::mutex> lock(send_buffer_mutex_);
@@ -312,9 +462,18 @@ void TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
   }
 
   std::string debug_msg = pkt->tcp_header().ack ?
-      "ack " + std::to_string(pkt->tcp_header().ack_num) :
-      "send " + std::to_string(pkt->tcp_header().seq_num)
-              + ", size = " + std::to_string(pkt->payload_size());
+      "ack " + std::to_string(pkt->tcp_header().ack_num) + ", ": "";
+
+  if (pkt->tcp_header().sync) {
+    debug_msg += ("sync " + std::to_string(pkt->tcp_header().seq_num));
+  } else if (pkt->payload_size() > 0) {
+    debug_msg += ("send " + std::to_string(pkt->tcp_header().seq_num));
+  } else if (!pkt->tcp_header().ack) {
+    // If not a ack packet, and payload size is zero, it's a receive window
+    // size prober.
+    debug_msg += "probing window size";
+  }
+
   debuginfo(debug_msg);
 
   pkt_send_buffer_.Push(std::move(pkt));
@@ -387,11 +546,26 @@ std::unique_ptr<Packet> TcpController::MakeAckPacket(uint32 ack_num) {
 
   {
     std::unique_lock<std::mutex> recv_buffer_lock(recv_buffer_mutex_);
-    tcp_header.window_size = recv_buffer_.free_space() > kMaxWindowSize ?
-                                 kMaxWindowSize : recv_buffer_.free_space();
+    tcp_header.window_size = recv_buffer_.free_space();
   }
 
   std::unique_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
+  return pkt;
+}
+
+std::shared_ptr<Packet> TcpController::MakeSyncPacket(uint32 seq_num) {
+  IPHeader ip_header;
+  ip_header.source_ip = key_.source_ip;
+  ip_header.dest_ip = key_.dest_ip;
+
+  TcpHeader tcp_header;
+  tcp_header.source_port = key_.source_port;
+  tcp_header.dest_port = key_.dest_port;
+  tcp_header.sync = true;
+  tcp_header.seq_num = seq_num;
+
+  std::shared_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
+  pkt->set_payload_size(1);
   return pkt;
 }
 
