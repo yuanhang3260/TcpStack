@@ -44,8 +44,8 @@ TcpController::TcpController(Host* host,
       std::bind(&TcpController::SocketSendBufferListener, this));
   thread_pool_.AddTask(
       std::bind(&TcpController::PacketSendBufferListener, this));
-  thread_pool_.AddTask(
-      std::bind(&TcpController::SocketReceiveBufferListener, this));
+  // thread_pool_.AddTask(
+  //     std::bind(&TcpController::SocketReceiveBufferListener, this));
   thread_pool_.Start();
 }
 
@@ -90,11 +90,48 @@ bool TcpController::TryConnect() {
   // Here we simply wait for TCP state transitted to ESTABLISHED.
   SendPacket(std::unique_ptr<Packet>(sync_pkt->Copy()));
   timer_.Restart();
+  
+  std::unique_lock<std::mutex> state_lock(state_mutex_);
+  state_ = SYN_SENT;
+  state_cv_.wait(state_lock, [&] { return state_ == ESTABLISHED; });
+
+  return true;
+}
+
+bool TcpController::TryClose() {
   {
     std::unique_lock<std::mutex> state_lock(state_mutex_);
-    state_ = SYN_SENT;
-    state_cv_.wait(state_lock, [&] { return state_ == ESTABLISHED; });
+    if (state_ != ESTABLISHED) {
+      LogERROR("TCP state is not ESTABLISHED, can't Close");
+      return false;
+    }
   }
+
+  std::shared_ptr<Packet> fin_pkt;
+  {
+    std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
+    fin_pkt = MakeFinPacket(send_window_.NextSeqNumberToSend());
+    if (!send_window_.SendPacket(fin_pkt)) {
+      LogFATAL("Failed to send FIN segment");
+      return false;
+    }
+  }
+
+  // Need to set TCP state here, before really sending the FIN segment.
+  // Otherwise it can over-write following states (FIN_WAIT_2, TIME_WAIT).
+  {
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    state_ = FIN_WAIT_1;
+  }
+  SendPacket(std::unique_ptr<Packet>(fin_pkt->Copy()));
+  timer_.Restart();
+
+  // Wait for TCP status transitted to TIME_WAIT. This state can last a
+  // relatively long time (~1 minute), but Close() can safely return in this
+  // TCP state. When TCP state finally transitted to CLOSED, all connection
+  // resource (port, buffer, etc) will be released by host system.
+  std::unique_lock<std::mutex> state_lock(state_mutex_);
+  state_cv_.wait(state_lock, [&] { return state_ == TIME_WAIT; });
 
   return true;
 }
@@ -107,7 +144,7 @@ void TcpController::ReceiveNewPacket(std::unique_ptr<Packet> packet) {
 }
 
 void TcpController::PacketReceiveBufferListner() {
-  while (1) {
+  while (true) {
     // Get all new packets.
     std::queue<std::unique_ptr<Packet>> new_packets;
     pkt_recv_buffer_.DeQueueAllTo(&new_packets);
@@ -136,7 +173,7 @@ void TcpController::HandleReceivedPackets(
                    "Server's recv_base should be client_seq_num + 1 = %u, "
                    "but actually it's %u",
                    client_seq_num + 1, pair.first);
-      
+
       // If it is not the first SYNC received from client, we alread have a
       // SYNC_ACK segment cached in send window. Just re-send it.
       {
@@ -215,6 +252,25 @@ void TcpController::HandleReceivedPackets(
       recv_window_.set_recv_base(pkt->tcp_header().seq_num + 1);
       SendPacket(std::move(MakeAckPacket(pkt->tcp_header().seq_num + 1)));
 
+    } else if (pkt->tcp_header().fin) {
+      // FIN segment. Ack this segment, and transit TCP state.
+
+      // Deliver this FIN packet to upper level to notify blocking Read().
+      auto pair = recv_window_.ReceivePacket(std::move(pkt));
+      StreamDataToReceiveBuffer(pair.second);
+
+      // Ack this FIN, and transit TCP state.
+      std::unique_lock<std::mutex> state_lock(state_mutex_);
+      SendPacket(std::move(MakeAckPacket(pair.first)));
+
+      if (state_ == ESTABLISHED) {
+        state_ = CLOSE_WAIT;
+      } else if (state_ == FIN_WAIT_2) {
+        // Notify the thread waiting on Close().
+        state_ = TIME_WAIT;
+        state_cv_.notify_one();
+      }
+
     } else if (pkt->tcp_header().ack) {
       std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
 
@@ -241,16 +297,47 @@ void TcpController::HandleReceivedPackets(
       }
       send_window_lock.unlock();
 
-      // If server is waiting for client's 3rd handshake ack segment, now
-      // we can mark server --> client connection is ready.
+      // Here we need to handle some special acks for TCP handshake and wavebye.
+      bool close_wait_done = false;
       {
         std::unique_lock<std::mutex> state_lock(state_mutex_);
         if (state_ == SYN_RCVD) {
+          // If server is waiting for client's 3rd handshake ack segment, now
+          // we can mark server --> client connection is ready.
           state_ = ESTABLISHED;
           debuginfo("Server --> Client connection established ^_^");
-          state_cv_.notify_one();
+        } else if (state_ == FIN_WAIT_1) {
+          // Received ACK for FIN_WAIT_1, transit to FIN_WAIT_2.
+          state_ = FIN_WAIT_2;
+        } else if (state_ == CLOSE_WAIT &&
+                   send_window_.NumPacketsToAck() == 0) {
+          // All data has been sent. Now it's okay to send second FIN and wait
+          // for final ack.
+          close_wait_done = true;
+        } else if (state_ == LAST_ACK) {
+          // Received last ack. This TCP connection can finally be closed.
+          state_ = CLOSED;
         }
       }
+
+      if (close_wait_done) {
+        std::shared_ptr<Packet> fin_pkt;
+        {
+          std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
+          fin_pkt = MakeFinPacket(send_window_.NextSeqNumberToSend());
+          if (!send_window_.SendPacket(fin_pkt)) {
+            LogFATAL("Failed to send FIN segment");
+            continue;
+          }
+        }
+        {
+          std::unique_lock<std::mutex> state_lock(state_mutex_);
+          state_ = LAST_ACK;
+        }
+        SendPacket(std::unique_ptr<Packet>(fin_pkt->Copy()));
+        timer_.Restart();
+      }
+
     } else {
       if (pkt->payload_size() == 0) {
         // This is a zero-size data packet. Sender is probing receive window
@@ -366,13 +453,13 @@ int32 TcpController::ReadData(byte* buf, int32 size) {
 }
 
 int32 TcpController::WriteData(const byte* buf, int32 size) {
-  // {
-  //   std::unique_lock<std::mutex> lock(state_mutex_);
-  //   if (state_ != ESTABLISHED) {
-  //     LogERROR("TCP connection not established, abort WriteData");
-  //     return -1;
-  //   }
-  // }
+  {
+    std::unique_lock<std::mutex> lock(state_mutex_);
+    if (state_ != ESTABLISHED) {
+      LogERROR("TCP state not in ESTABLISHED, cannot send data");
+      return -1;
+    }
+  }
 
   uint32 writen = 0;
   {
@@ -389,6 +476,15 @@ int32 TcpController::WriteData(const byte* buf, int32 size) {
 
 void TcpController::SocketSendBufferListener() {
   while (true) {
+    // User called Close() and TCP state transitted to FIN_WAIT_1, no more data
+    // should sent from now. This thread can safely exit.
+    {
+      std::unique_lock<std::mutex> lock_send_window(state_mutex_);
+      if (state_ == FIN_WAIT_1) {
+        break;
+      }
+    }
+
     // Wait for send window to be not full.
     std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
     send_window_cv_.wait(lock_send_window,
@@ -562,6 +658,22 @@ std::shared_ptr<Packet> TcpController::MakeSyncPacket(uint32 seq_num) {
   tcp_header.source_port = key_.source_port;
   tcp_header.dest_port = key_.dest_port;
   tcp_header.sync = true;
+  tcp_header.seq_num = seq_num;
+
+  std::shared_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
+  pkt->set_payload_size(1);
+  return pkt;
+}
+
+std::shared_ptr<Packet> TcpController::MakeFinPacket(uint32 seq_num) {
+  IPHeader ip_header;
+  ip_header.source_ip = key_.source_ip;
+  ip_header.dest_ip = key_.dest_ip;
+
+  TcpHeader tcp_header;
+  tcp_header.source_port = key_.source_port;
+  tcp_header.dest_port = key_.dest_port;
+  tcp_header.fin = true;
   tcp_header.seq_num = seq_num;
 
   std::shared_ptr<Packet> pkt(new Packet(ip_header, tcp_header));

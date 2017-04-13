@@ -15,6 +15,10 @@ PacketQueue::~PacketQueue() {
 }
 
 void PacketQueue::Stop() {
+  if (destroy_.load()) {
+    return;
+  }
+
   destroy_.store(true);
   cv_.notify_all();
 

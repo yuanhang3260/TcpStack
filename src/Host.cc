@@ -284,6 +284,26 @@ bool Host::Connect(int32 sock_fd,
   return true;
 }
 
+bool Host::Close(int32 sock_fd) {
+  TcpController* tcp_con = nullptr;
+  {
+    std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
+    auto it = socket_tcp_map_.find(sock_fd);
+    if (it == socket_tcp_map_.end()) {
+      LogERROR("Can't find tcp connection bind with socket %u", sock_fd);
+      return -1;
+    }
+    tcp_con = it->second;
+  }
+
+  auto re = tcp_con->TryClose();
+  if (!re) {
+    // TODO: Close fail?
+    return false;
+  }
+  return true;  
+}
+
 uint32 Host::GetRandomPort() {
   std::unique_lock<std::mutex> port_pool_lock(port_pool_mutex_);
   uint32 size = port_pool_.size();

@@ -50,6 +50,8 @@ class Host {
   bool Listen(int32 sock_fd);
   int Accept(int32 sock_fd);
 
+  bool Close(int32 sock_fd);
+
   std::string hostname() const { return hostname_; }
   std::string ip_address() const { return ip_address_; }
 

@@ -103,6 +103,11 @@ class TcpController {
     ESTABLISHED,
     LISTEN,
     SYN_RCVD,
+    FIN_WAIT_1,
+    FIN_WAIT_2,
+    TIME_WAIT,
+    CLOSE_WAIT,
+    LAST_ACK,
   };
 
   TcpController(Host* host, const TcpControllerKey& tcp_id, int32 socket_fd,
@@ -120,6 +125,9 @@ class TcpController {
 
   // Connect to remote host. It sends a SYNC segment.
   bool TryConnect();
+
+  // Close a TCP connection. It sends a FIN segment.
+  bool TryClose();
 
  private:
   // These methods serve uplink packet/data delivery (receive data).
@@ -149,6 +157,8 @@ class TcpController {
   std::unique_ptr<Packet> MakeAckPacket(uint32 ack_num);
 
   std::shared_ptr<Packet> MakeSyncPacket(uint32 seq_num);
+
+  std::shared_ptr<Packet> MakeFinPacket(uint32 seq_num);
 
   void debuginfo(const std::string& msg);
 
