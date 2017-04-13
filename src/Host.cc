@@ -136,17 +136,64 @@ void Host::PacketsSendListener() {
 
 void Host::CreateTcpConnection(const std::string& source_ip, uint32 source_port,
                                uint32 local_port, uint32 socket_fd) {
+  std::unique_lock<std::mutex> connections_lock(connections_mutex_);
   TcpControllerKey tcp_key{source_ip, source_port, ip_address_, local_port};
   connections_.emplace(tcp_key,
                        ptr::MakeUnique<TcpController>(
                           this, tcp_key, socket_fd,
                           TcpController::GetDefaultOptions()));
+  connections_lock.unlock();
 
   std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
   socket_tcp_map_.emplace(socket_fd, connections_.at(tcp_key).get());
 }
 
+void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
+  // Remove from connection map.
+  std::unique_lock<std::mutex> connections_lock(connections_mutex_);
+  auto it = connections_.find(tcp_key);
+  if (it == connections_.end()) {
+    LogERROR("Can't find TCP connection %s, skip deleting",
+             tcp_key.DebugString().c_str());
+    return;
+  }
+  int32 socket_fd = it->second->socket_fd();
+  connections_lock.unlock();
+
+  // Wait for this connection is ready to be deleted. Don't wait inside any
+  // lock of host.
+  it->second->WaitForReadyToDestroy();
+
+  // Remove from socket connection map.
+  std::unique_lock<std::mutex> socket_tcp_map_lock(socket_tcp_map_mutex_);
+  auto it2 = socket_tcp_map_.find(socket_fd);
+  if (it2 == socket_tcp_map_.end()) {
+    LogERROR("Can't find TCP connection %s bound to any socket",
+             tcp_key.DebugString().c_str());
+  }
+  socket_tcp_map_.erase(it2);
+  socket_tcp_map_lock.unlock();
+
+  // Delete connection object.
+  connections_lock.lock();
+  connections_.erase(it);
+  connections_lock.unlock();
+
+  // Release port.
+  ReleasePort(tcp_key.dest_port);
+
+  LogINFO("Connection %s safely deleted ^_^", tcp_key.DebugString().c_str());
+}
+
 int32 Host::ReadData(int32 socket_fd, byte* buffer, int32 size) {
+  {
+    std::unique_lock<std::mutex> fd_pool_lock(fd_pool_mutex_);
+    if (fd_pool_.find(socket_fd) != fd_pool_.end()) {
+      LogERROR("Bad socket %d", socket_fd);
+      return -1;
+    }
+  }
+
   TcpController* tcp_con;
   {
     std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
@@ -161,6 +208,14 @@ int32 Host::ReadData(int32 socket_fd, byte* buffer, int32 size) {
 }
 
 int32 Host::WriteData(int32 socket_fd, const byte* buffer, int32 size) {
+  {
+    std::unique_lock<std::mutex> fd_pool_lock(fd_pool_mutex_);
+    if (fd_pool_.find(socket_fd) != fd_pool_.end()) {
+      LogERROR("Bad socket %d", socket_fd);
+      return -1;
+    }
+  }
+
   TcpController* tcp_con;
   {
     std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
@@ -301,6 +356,10 @@ bool Host::Close(int32 sock_fd) {
     // TODO: Close fail?
     return false;
   }
+
+  // Release the file descriptor.
+  ReleaseFileDescriptor(sock_fd);
+
   return true;  
 }
 

@@ -129,6 +129,14 @@ class TcpController {
   // Close a TCP connection. It sends a FIN segment.
   bool TryClose();
 
+  // Shut down this connection. It stops all threads of this connection object.
+  void ShutDown();
+
+  // This is called by host to wait for this connection object can be deleted.
+  void WaitForReadyToDestroy();
+
+  int32 socket_fd() const { return socket_fd_; }
+
  private:
   // These methods serve uplink packet/data delivery (receive data).
   void PacketReceiveBufferListner();
@@ -180,6 +188,13 @@ class TcpController {
   std::mutex recv_buffer_mutex_;
   std::condition_variable recv_buffer_read_cv_;
   std::condition_variable recv_buffer_write_cv_;
+
+  enum SocketStatus {
+    OPEN,
+    EOF_NOT_READ,
+    EOF_READ,
+  };
+  std::atomic<SocketStatus> socket_status_;
   // This is a temporary queue to store overflowed packets when socket receive
   // buffer is full. This is for a corner case of flow control. When receive
   // window size is 0, sender will continue sending packets with size 1 byte.
@@ -207,6 +222,12 @@ class TcpController {
   TCP_STATE state_ = CLOSED;
   std::mutex state_mutex_;
   std::condition_variable state_cv_;
+
+  std::atomic_bool shutdown_;
+
+  bool destroy_ = false;
+  std::mutex destroy_mutex_;
+  std::condition_variable destroy_cv_;
 };
 
 }  // namespace net_stack

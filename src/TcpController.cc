@@ -35,6 +35,7 @@ TcpController::TcpController(Host* host,
     timer_(std::chrono::milliseconds(5 * 100),
            std::bind(&TcpController::TimeoutReTransmitter, this)) {
   state_ = CLOSED;
+  socket_status_.store(OPEN);
 
   timer_.SetRepeat(true);
 
@@ -59,10 +60,24 @@ TcpControllerOptions TcpController::GetDefaultOptions() {
 }
 
 TcpController::~TcpController() {
+}
+
+void TcpController::ShutDown() {
+  if (shutdown_.load()) {
+    return;
+  }
+
+  shutdown_.store(true);
+  send_window_cv_.notify_all();
+  send_buffer_cv_.notify_all();
+
   pkt_recv_buffer_.Stop();
   pkt_send_buffer_.Stop();
+
   thread_pool_.Stop();
   thread_pool_.AwaitTermination();
+
+  LogINFO("TcpConnection %s destroyed ^_^", key_.DebugString().c_str());
 }
 
 bool TcpController::TryConnect() {
@@ -101,6 +116,10 @@ bool TcpController::TryConnect() {
 bool TcpController::TryClose() {
   {
     std::unique_lock<std::mutex> state_lock(state_mutex_);
+    // The connection is already into closing states.
+    if (state_ == CLOSE_WAIT || state_ == LAST_ACK || state_ == CLOSED) {
+      return true;
+    }
     if (state_ != ESTABLISHED) {
       LogERROR("TCP state is not ESTABLISHED, can't Close");
       return false;
@@ -269,6 +288,24 @@ void TcpController::HandleReceivedPackets(
         // Notify the thread waiting on Close().
         state_ = TIME_WAIT;
         state_cv_.notify_one();
+
+        // Wait for 2 seconds (in reality TIME_WAIT should last 1 ~ 2 minutes),
+        // and destroy this TCP connection.
+        std::thread shut_down([&] {
+          std::this_thread::sleep_for(std::chrono::seconds(2));
+          ShutDown();
+          // Notify host to delete this connection and all its resource,
+          // after current thread exits. This should be the last thread bound
+          // of this connection object.
+          std::unique_lock<std::mutex> lock(destroy_mutex_);
+          std::notify_all_at_thread_exit(destroy_cv_, std::move(lock));
+          destroy_ = true;
+        });
+        shut_down.detach();
+
+        std::thread final_clean(
+            std::bind(&Host::DeleteTcpConnection, host_, key_));
+        final_clean.detach();
       }
 
     } else if (pkt->tcp_header().ack) {
@@ -317,6 +354,21 @@ void TcpController::HandleReceivedPackets(
         } else if (state_ == LAST_ACK) {
           // Received last ack. This TCP connection can finally be closed.
           state_ = CLOSED;
+
+          std::thread shut_down([&] {
+            ShutDown();
+            // Notify host to delete this connection and all its resource,
+            // after current thread exits. This should be the last thread bound
+            // of this connection object.
+            std::unique_lock<std::mutex> lock(destroy_mutex_);
+            std::notify_all_at_thread_exit(destroy_cv_, std::move(lock));
+            destroy_ = true;
+          });
+          shut_down.detach();
+
+          std::thread final_clean(
+              std::bind(&Host::DeleteTcpConnection, host_, key_));
+          final_clean.detach();
         }
       }
 
@@ -373,6 +425,11 @@ void TcpController::StreamDataToReceiveBuffer(
       // Special segment.
       if (pkt->tcp_header().sync) {
         continue;
+      }
+
+      if (pkt->tcp_header().fin) {
+        socket_status_.store(EOF_NOT_READ);
+        break;
       }
 
       if (recv_buffer_.free_space() >= pkt->payload_size()) {
@@ -436,9 +493,21 @@ int32 TcpController::ReadData(byte* buf, int32 size) {
   //   }
   // }
 
+  if (socket_status_.load() == EOF_READ) {
+    LogERROR("Broken pipe %d", socket_fd_);
+    return -1;
+  }
+
   std::unique_lock<std::mutex> lock(recv_buffer_mutex_);
   recv_buffer_read_cv_.wait(lock,
-      [this] { return !recv_buffer_.empty(); });
+      [this] { return socket_status_.load() == EOF_NOT_READ ||
+                      !recv_buffer_.empty(); });
+
+  // Socket is closed by the other side.
+  if (socket_status_.load() == EOF_NOT_READ && recv_buffer_.empty()) {
+    socket_status_.store(EOF_READ);
+    return 0;
+  }
 
   // Copy data to user buffer.
   // TODO: replace with RingBuffer to check flow control.
@@ -488,14 +557,22 @@ void TcpController::SocketSendBufferListener() {
     // Wait for send window to be not full.
     std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
     send_window_cv_.wait(lock_send_window,
-                         [this] { return send_window_.free_space() > 0 ||
+                         [this] { return shutdown_.load() ||
+                                         send_window_.free_space() > 0 ||
                                          send_window_.capacity() <= 0; });
+    if (shutdown_.load()) {
+      return;
+    }
     lock_send_window.unlock();
 
     // Wait for socket send buffer to have data to send.
     std::unique_lock<std::mutex> lock_send_buffer(send_buffer_mutex_);
     send_buffer_cv_.wait(lock_send_buffer,
-        [this] { return !send_buffer_.empty(); });
+        [this] { return shutdown_.load() || !send_buffer_.empty(); });
+
+    if (shutdown_.load()) {
+      return;
+    }
 
     // Lock send window again. Check free space again, because the window size
     // can be reduced by flow control.
@@ -683,6 +760,12 @@ std::shared_ptr<Packet> TcpController::MakeFinPacket(uint32 seq_num) {
 
 void TcpController::debuginfo(const std::string& msg) {
   LogINFO((host_->hostname() + ": " + msg).c_str());
+}
+
+void TcpController::WaitForReadyToDestroy() {
+  // Wait for destroy signal.
+  std::unique_lock<std::mutex> lock(destroy_mutex_);
+  destroy_cv_.wait(lock, [&] { return destroy_; });
 }
 
 }  // namespace net_stack

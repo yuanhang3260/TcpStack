@@ -18,7 +18,7 @@ const uint32 kBobPort = 20;
 const uint32 kAliceSocket = 5;
 const uint32 kBobSocket = 5;
 
-const uint32 kTestDataSize = 500;
+const uint32 kTestDataSize = 10;
 byte* data;
 byte* receive_buffer;
 
@@ -125,6 +125,8 @@ int main(int argc, char** argv) {
     if (flip_correct) {
       printf("Alice received correct data \033[2;32m:)\033[0m\n");
     }
+
+    alice.Close(sock_fd);
   };
 
   auto bob_thread = [&] () {

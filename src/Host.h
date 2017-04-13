@@ -1,6 +1,7 @@
 #ifndef NET_STACK_HOST_
 #define NET_STACK_HOST_
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -36,6 +37,9 @@ class Host {
   // TODO: Make this private.
   void CreateTcpConnection(const std::string& source_ip, uint32 source_port,
                            uint32 local_port, uint32 socket_fd);
+
+  // Remove a tcp connection and release all its resource.
+  void DeleteTcpConnection(const TcpControllerKey& tcp_key);
 
   // Read and write data with socket.
   int32 ReadData(int32 socket_fd, byte* buffer, int32 size);
@@ -90,10 +94,11 @@ class Host {
   using TcpConnectionMap = 
       std::unordered_map<TcpControllerKey, std::unique_ptr<TcpController>>;
   TcpConnectionMap connections_;
+  std::mutex connections_mutex_;
 
   // This map maintains socket fd --> TcpController
-  std::mutex socket_tcp_map_mutex_;
   std::unordered_map<int32, TcpController*> socket_tcp_map_;
+  std::mutex socket_tcp_map_mutex_;
 
   // All available file descriptors.
   std::set<int32> fd_pool_;
