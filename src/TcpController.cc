@@ -9,7 +9,7 @@
 namespace net_stack {
 
 namespace {
-uint32 kThreadPoolSize = 4;
+uint32 kThreadPoolSize = 6;
 
 uint32 kDefaultDataPacketSize = 10;
 
@@ -69,15 +69,13 @@ void TcpController::ShutDown() {
 
   shutdown_.store(true);
   send_window_cv_.notify_all();
-  send_buffer_cv_.notify_all();
+  send_buffer_data_cv_.notify_all();
 
   pkt_recv_buffer_.Stop();
   pkt_send_buffer_.Stop();
 
   thread_pool_.Stop();
   thread_pool_.AwaitTermination();
-
-  LogINFO("TcpConnection %s destroyed ^_^", key_.DebugString().c_str());
 }
 
 bool TcpController::TryConnect() {
@@ -98,16 +96,20 @@ bool TcpController::TryConnect() {
       return false;
     }
   }
+  
+  {
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    state_ = SYN_SENT;
+  }
 
   // Send the sync packet (1st handshake), and wait for remote host's
-  // SYNC_ACK segment (2nd handshake).
+  // SYN_ACK segment (2nd handshake).
   //
   // Here we simply wait for TCP state transitted to ESTABLISHED.
   SendPacket(std::unique_ptr<Packet>(sync_pkt->Copy()));
   timer_.Restart();
-  
+
   std::unique_lock<std::mutex> state_lock(state_mutex_);
-  state_ = SYN_SENT;
   state_cv_.wait(state_lock, [&] { return state_ == ESTABLISHED; });
 
   return true;
@@ -163,7 +165,7 @@ void TcpController::ReceiveNewPacket(std::unique_ptr<Packet> packet) {
 }
 
 void TcpController::PacketReceiveBufferListner() {
-  while (true) {
+  while (!shutdown_.load()) {
     // Get all new packets.
     std::queue<std::unique_ptr<Packet>> new_packets;
     pkt_recv_buffer_.DeQueueAllTo(&new_packets);
@@ -174,237 +176,247 @@ void TcpController::PacketReceiveBufferListner() {
   }
 }
 
+bool TcpController::HandleDataPacket(std::unique_ptr<Packet> pkt) {
+  if (pkt->payload_size() == 0) {
+    // This is a zero-size data packet. Sender is probing receive window
+    // size.
+    SendPacket(std::move(MakeAckPacket(recv_window_.recv_base())));
+    return true;
+  }
+
+  // Handle data packet. Deliver packets to upper layer (socket receive
+  // buffer) if avaible, and sends ack packet back to sender.
+  auto pair = recv_window_.ReceivePacket(std::move(pkt));
+  StreamDataToReceiveBuffer(pair.second);
+  SendPacket(std::move(MakeAckPacket(pair.first)));
+
+  return true;
+}
+
 void TcpController::HandleReceivedPackets(
     std::queue<std::unique_ptr<Packet>>* new_packets) {
   while (!new_packets->empty()) {
     std::unique_ptr<Packet> pkt = std::move(new_packets->front());
     new_packets->pop();
 
-    // SYNC segment (1st handshake) from client
-    //
-    // Client is trying to establish connection. Send a SYNC_ACK segment back.
     if (pkt->tcp_header().sync && !pkt->tcp_header().ack) {
-      // Receive window's recv base has already been intialized as client's
-      // seq_num. Now it should increment by 1 to client_seq_num + 1.
-      uint32 client_seq_num = pkt->tcp_header().seq_num;
-      auto pair = recv_window_.ReceivePacket(std::move(pkt));
-      SANITY_CHECK(pair.first == client_seq_num + 1,
-                   "Server's recv_base should be client_seq_num + 1 = %u, "
-                   "but actually it's %u",
-                   client_seq_num + 1, pair.first);
-
-      // If it is not the first SYNC received from client, we alread have a
-      // SYNC_ACK segment cached in send window. Just re-send it.
-      {
-        std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
-        if (send_window_.size() > 0) {
-          SendPacket(send_window_.BasePakcketWaitingForAck());
-          continue;
-        }
-      }
-
-      // Create a SYNC_ACK packet, with a randomly generated server_seq_num,
-      // and ack clients SYNC packet with ack_num = client_seq_num + 1.
-      uint32 server_seq_num = 0; /* Utils::RandomNumber(); */
-      auto sync_ack_pkt = MakeSyncPacket(server_seq_num);
-      sync_ack_pkt->mutable_tcp_header()->ack = true;
-      sync_ack_pkt->mutable_tcp_header()->ack_num = pair.first;
-      {
-        // This SYNC_ACK packet contains server's receive window size so that
-        // client can init its flow control before sending any data packet.
-        std::unique_lock<std::mutex> recv_buffer_lock(recv_buffer_mutex_);
-        sync_ack_pkt->mutable_tcp_header()
-                        ->window_size = recv_buffer_.free_space();
-      }
-
-      // SYNC_ACK packet is firstly a SYNC packet. It needs to be recorded in
-      // send window.
-      {
-        std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
-        if (!send_window_.SendPacket(sync_ack_pkt)) {
-          LogERROR("Failed to send SYNC_ACK packet");
-          continue;
-        }
-      }
-
-      // Really send SYNC_ACK segment.
-      SendPacket(std::unique_ptr<Packet>(sync_ack_pkt->Copy()));
-      timer_.Restart();
-
-      // Server's TCP state transition.
-      {
-        std::unique_lock<std::mutex> state_lock(state_mutex_);
-        state_ = SYN_RCVD;
-      }
-
-      // Wait for client's ack packet (3rd handshake). It should be a normal
-      // ack segment sent from client with ack_num = server_seq_num + 1.
-
+      HandleSYN(std::move(pkt));
     } else if (pkt->tcp_header().sync && pkt->tcp_header().ack) {
-      // SYNC_ACK segment (2nd handshake) from server
-      //
-      // Client handles ack part. After this, client's send base should
-      // increment by one, and send windows size is also synced with server's
-      // receive buffer size. It is now ready to send data packets.
-      std::unique_lock<std::mutex> state_lock(state_mutex_);
-      if (state_ == SYN_SENT) {
-        {
-          std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
-          send_window_.NewAckedPacket(pkt->tcp_header().ack_num);
-          if (send_window_.NumPacketsToAck() == 0) {
-            timer_.Stop();
-          }
-          debuginfo("set window_size = " +
-                    std::to_string(pkt->tcp_header().window_size));
-          send_window_.set_capacity(pkt->tcp_header().window_size);
-        }
-
-        // Mark client --> server connection is ready.
-        state_ = ESTABLISHED;
-        debuginfo("Client --> Server connection established ^_^");
-        state_cv_.notify_one();
-      }
-      state_lock.unlock();
-
-      // Client handles sync part. Client should init its receive window base
-      // as server's seq_num, and ack this segment (3rd handshake).
-      recv_window_.set_recv_base(pkt->tcp_header().seq_num + 1);
-      SendPacket(std::move(MakeAckPacket(pkt->tcp_header().seq_num + 1)));
-
+      HandleACKSYN(std::move(pkt));
     } else if (pkt->tcp_header().fin) {
-      // FIN segment. Ack this segment, and transit TCP state.
-
-      // Deliver this FIN packet to upper level to notify blocking Read().
-      auto pair = recv_window_.ReceivePacket(std::move(pkt));
-      StreamDataToReceiveBuffer(pair.second);
-
-      // Ack this FIN, and transit TCP state.
-      std::unique_lock<std::mutex> state_lock(state_mutex_);
-      SendPacket(std::move(MakeAckPacket(pair.first)));
-
-      if (state_ == ESTABLISHED) {
-        state_ = CLOSE_WAIT;
-      } else if (state_ == FIN_WAIT_2) {
-        // Notify the thread waiting on Close().
-        state_ = TIME_WAIT;
-        state_cv_.notify_one();
-
-        // Wait for 2 seconds (in reality TIME_WAIT should last 1 ~ 2 minutes),
-        // and destroy this TCP connection.
-        std::thread shut_down([&] {
-          std::this_thread::sleep_for(std::chrono::seconds(2));
-          ShutDown();
-          // Notify host to delete this connection and all its resource,
-          // after current thread exits. This should be the last thread bound
-          // of this connection object.
-          std::unique_lock<std::mutex> lock(destroy_mutex_);
-          std::notify_all_at_thread_exit(destroy_cv_, std::move(lock));
-          destroy_ = true;
-        });
-        shut_down.detach();
-
-        std::thread final_clean(
-            std::bind(&Host::DeleteTcpConnection, host_, key_));
-        final_clean.detach();
-      }
-
+      HandleFIN(std::move(pkt));
     } else if (pkt->tcp_header().ack) {
-      std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
+      HandleACK(std::move(pkt));
+    } else {
+      HandleDataPacket(std::move(pkt));
+    }
+  }
+}
 
-      // Handle ack packet. If detect duplicated ACKs, do a fast re-transmit.
-      bool re_transmit = send_window_.NewAckedPacket(pkt->tcp_header().ack_num);
-      if (re_transmit) {
-        SendPacket(send_window_.BasePakcketWaitingForAck());
-      }
-      // If send window is cleared, stop the timer.
+bool TcpController::HandleSYN(std::unique_ptr<Packet> pkt) {
+  // SYN segment (1st handshake) from client
+  //
+  // Client is trying to establish connection. Send a SYN_ACK segment back.
+
+  // Receive window's recv base has already been intialized as client's
+  // seq_num. Now it should increment by 1 to client_seq_num + 1.
+  uint32 client_seq_num = pkt->tcp_header().seq_num;
+  auto pair = recv_window_.ReceivePacket(std::move(pkt));
+  SANITY_CHECK(pair.first == client_seq_num + 1,
+               "Server's recv_base should be client_seq_num + 1 = %u, "
+               "but actually it's %u",
+               client_seq_num + 1, pair.first);
+
+  // If it is not the first SYN received from client, we alread have a
+  // SYN_ACK segment cached in send window. Just re-send it.
+  {
+    std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
+    if (send_window_.size() > 0) {
+      SendPacket(send_window_.BasePakcketWaitingForAck());
+      return true;
+    }
+  }
+
+  // Create a SYN_ACK packet, with a randomly generated server_seq_num,
+  // and ack clients SYN packet with ack_num = client_seq_num + 1.
+  uint32 server_seq_num = 0; /* Utils::RandomNumber(); */
+  auto sync_ack_pkt = MakeSyncPacket(server_seq_num);
+  sync_ack_pkt->mutable_tcp_header()->ack = true;
+  sync_ack_pkt->mutable_tcp_header()->ack_num = pair.first;
+  {
+    // This SYN_ACK packet contains server's receive window size so that
+    // client can init its flow control before sending any data packet.
+    std::unique_lock<std::mutex> recv_buffer_lock(recv_buffer_mutex_);
+    sync_ack_pkt->mutable_tcp_header()
+                    ->window_size = recv_buffer_.free_space();
+  }
+
+  // SYN_ACK packet is firstly a SYN packet. It needs to be recorded in
+  // send window.
+  {
+    std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
+    if (!send_window_.SendPacket(sync_ack_pkt)) {
+      LogERROR("Failed to send SYN_ACK packet");
+      return false;
+    }
+  }
+
+  // Really send SYN_ACK segment.
+  SendPacket(std::unique_ptr<Packet>(sync_ack_pkt->Copy()));
+  timer_.Restart();
+
+  // Server's TCP state transition.
+  {
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    state_ = SYN_RCVD;
+  }
+
+  // Wait for client's ack packet (3rd handshake). It should be a normal
+  // ack segment sent from client with ack_num = server_seq_num + 1.
+  return true;
+}
+
+bool TcpController::HandleACKSYN(std::unique_ptr<Packet> pkt) {
+  // SYN_ACK segment (2nd handshake) from server
+  //
+  // Client handles ack part. After this, client's send base should
+  // increment by one, and send windows size is also synced with server's
+  // receive buffer size. It is now ready to send data packets.
+  std::unique_lock<std::mutex> state_lock(state_mutex_);
+  if (state_ == SYN_SENT) {
+    {
+      std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
+      send_window_.NewAckedPacket(pkt->tcp_header().ack_num);
       if (send_window_.NumPacketsToAck() == 0) {
         timer_.Stop();
-      } else {
-        timer_.Restart();
       }
-
-      // Flow control - set send window size as receiver indicated.
       debuginfo("set window_size = " +
                 std::to_string(pkt->tcp_header().window_size));
       send_window_.set_capacity(pkt->tcp_header().window_size);
-
-      // If send window has free space, notify packet send thread.
-      if (send_window_.free_space() > 0 || send_window_.capacity() == 0) {
-        send_window_cv_.notify_one();
-      }
-      send_window_lock.unlock();
-
-      // Here we need to handle some special acks for TCP handshake and wavebye.
-      bool close_wait_done = false;
-      {
-        std::unique_lock<std::mutex> state_lock(state_mutex_);
-        if (state_ == SYN_RCVD) {
-          // If server is waiting for client's 3rd handshake ack segment, now
-          // we can mark server --> client connection is ready.
-          state_ = ESTABLISHED;
-          debuginfo("Server --> Client connection established ^_^");
-        } else if (state_ == FIN_WAIT_1) {
-          // Received ACK for FIN_WAIT_1, transit to FIN_WAIT_2.
-          state_ = FIN_WAIT_2;
-        } else if (state_ == CLOSE_WAIT &&
-                   send_window_.NumPacketsToAck() == 0) {
-          // All data has been sent. Now it's okay to send second FIN and wait
-          // for final ack.
-          close_wait_done = true;
-        } else if (state_ == LAST_ACK) {
-          // Received last ack. This TCP connection can finally be closed.
-          state_ = CLOSED;
-
-          std::thread shut_down([&] {
-            ShutDown();
-            // Notify host to delete this connection and all its resource,
-            // after current thread exits. This should be the last thread bound
-            // of this connection object.
-            std::unique_lock<std::mutex> lock(destroy_mutex_);
-            std::notify_all_at_thread_exit(destroy_cv_, std::move(lock));
-            destroy_ = true;
-          });
-          shut_down.detach();
-
-          std::thread final_clean(
-              std::bind(&Host::DeleteTcpConnection, host_, key_));
-          final_clean.detach();
-        }
-      }
-
-      if (close_wait_done) {
-        std::shared_ptr<Packet> fin_pkt;
-        {
-          std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
-          fin_pkt = MakeFinPacket(send_window_.NextSeqNumberToSend());
-          if (!send_window_.SendPacket(fin_pkt)) {
-            LogFATAL("Failed to send FIN segment");
-            continue;
-          }
-        }
-        {
-          std::unique_lock<std::mutex> state_lock(state_mutex_);
-          state_ = LAST_ACK;
-        }
-        SendPacket(std::unique_ptr<Packet>(fin_pkt->Copy()));
-        timer_.Restart();
-      }
-
-    } else {
-      if (pkt->payload_size() == 0) {
-        // This is a zero-size data packet. Sender is probing receive window
-        // size.
-        SendPacket(std::move(MakeAckPacket(recv_window_.recv_base())));
-        continue;
-      }
-
-      // Handle data packet. Deliver packets to upper layer (socket receive
-      // buffer) if avaible, and sends ack packet back to sender.
-      auto pair = recv_window_.ReceivePacket(std::move(pkt));
-      StreamDataToReceiveBuffer(pair.second);
-      SendPacket(std::move(MakeAckPacket(pair.first)));
     }
+
+    // Mark client --> server connection is ready.
+    state_ = ESTABLISHED;
+    debuginfo("Client --> Server connection established ^_^");
+    state_cv_.notify_one();
   }
+  state_lock.unlock();
+
+  // Client handles sync part. Client should init its receive window base
+  // as server's seq_num, and ack this segment (3rd handshake).
+  recv_window_.set_recv_base(pkt->tcp_header().seq_num + 1);
+  SendPacket(std::move(MakeAckPacket(pkt->tcp_header().seq_num + 1)));
+  return true;
+}
+
+bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
+  // FIN segment. Ack this segment, and transit TCP state.
+
+  // Deliver this FIN packet to upper level to notify blocking Read().
+  auto pair = recv_window_.ReceivePacket(std::move(pkt));
+  StreamDataToReceiveBuffer(pair.second);
+
+  // Ack this FIN, and transit TCP state.
+  std::unique_lock<std::mutex> state_lock(state_mutex_);
+  if (state_ == ESTABLISHED) {
+    // CLOSE_WAIT state waits for socket send buffer to become empty, and
+    // then send FIN back to the other side.
+    debuginfo("Got FIN 1");
+    state_ = CLOSE_WAIT;
+    thread_pool_.AddTask([&] {
+      DoCloseWait();
+    });
+  } else if (state_ == FIN_WAIT_2) {
+    debuginfo("Got FIN 2");
+    // Notify the thread waiting on Close().
+    state_ = TIME_WAIT;
+    state_cv_.notify_one();
+
+    // Wait for 2 seconds (in reality TIME_WAIT should last 1 ~ 2 minutes),
+    // and destroy this TCP connection.
+    std::thread shut_down([&] {
+      std::this_thread::sleep_for(std::chrono::seconds(20));
+      ShutDown();
+      // Notify host to delete this connection and all its resource,
+      // after current thread exits. This should be the last thread bound
+      // of this connection object.
+      std::unique_lock<std::mutex> lock(destroy_mutex_);
+      destroy_ = true;
+      destroy_cv_.notify_one();
+    });
+    shut_down.detach();
+
+    std::thread final_clean(
+        std::bind(&Host::DeleteTcpConnection, host_, key_));
+    final_clean.detach();
+  }
+  state_lock.unlock();
+
+  // Do ack. It may be acking this FIN, or still acking existing data packets.
+  SendPacket(std::move(MakeAckPacket(pair.first)));
+  return true;
+}
+
+bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
+  // ACK segment. Needs to handle TCP state transition.
+  std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
+
+  // Handle ack packet. If detect duplicated ACKs, do a fast re-transmit.
+  bool re_transmit = send_window_.NewAckedPacket(pkt->tcp_header().ack_num);
+  if (re_transmit) {
+    SendPacket(send_window_.BasePakcketWaitingForAck());
+  }
+  // If send window is cleared, stop the timer.
+  if (send_window_.NumPacketsToAck() == 0) {
+    timer_.Stop();
+  } else {
+    timer_.Restart();
+  }
+
+  // Flow control - set send window size as receiver indicated.
+  debuginfo("set window_size = " +
+            std::to_string(pkt->tcp_header().window_size));
+  send_window_.set_capacity(pkt->tcp_header().window_size);
+
+  // If send window has free space, notify packet send thread.
+  if (send_window_.free_space() > 0 || send_window_.capacity() == 0) {
+    send_window_cv_.notify_one();
+  }
+  send_window_lock.unlock();
+
+  // Here we need to handle some special acks for TCP handshake and wavebye.
+  std::unique_lock<std::mutex> state_lock(state_mutex_);
+  if (state_ == SYN_RCVD) {
+    // It is 3rd handshake from client, now we can mark server --> client
+    // connection is ready to send data.
+    state_ = ESTABLISHED;
+    debuginfo("Server --> Client connection established ^_^");
+  } else if (state_ == FIN_WAIT_1) {
+    // Received ACK for FIN_WAIT_1, transit to FIN_WAIT_2.
+    debuginfo("Got ACK for FIN 1");
+    state_ = FIN_WAIT_2;
+  } else if (state_ == LAST_ACK) {
+    debuginfo("Got LAST_ACK");
+    // Received last ack. This TCP connection can finally be closed.
+    state_ = CLOSED;
+
+    std::thread shut_down([&] {
+      ShutDown();
+      // Notify host to delete this connection and all its resource,
+      // after current thread exits. This should be the last thread bound
+      // of this connection object.
+      std::unique_lock<std::mutex> lock(destroy_mutex_);
+      destroy_ = true;
+      destroy_cv_.notify_one();
+    });
+    shut_down.detach();
+
+    std::thread final_clean(
+        std::bind(&Host::DeleteTcpConnection, host_, key_));
+    final_clean.detach();
+  }
+
+  return true;
 }
 
 void TcpController::StreamDataToReceiveBuffer(
@@ -483,6 +495,31 @@ void TcpController::PushOverflowedPacketsToSocketBuffer() {
   }
 }
 
+void TcpController::DoCloseWait() {
+  // CLOSE_WAIT wait for send buffer to become empty, and then send FIN.
+  {
+    std::unique_lock<std::mutex> lock_send_window(send_buffer_mutex_);
+    send_buffer_empty_cv_.wait(lock_send_window,
+        [this] { return send_buffer_.empty(); });
+  }
+
+  // Send FIN and transit TCP state to LAST_ACK.
+  std::shared_ptr<Packet> fin_pkt;
+  {
+    std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
+    fin_pkt = MakeFinPacket(send_window_.NextSeqNumberToSend());
+    if (!send_window_.SendPacket(fin_pkt)) {
+      LogFATAL("Failed to send FIN segment");
+    }
+  }
+  {
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    state_ = LAST_ACK;
+  }
+  SendPacket(std::unique_ptr<Packet>(fin_pkt->Copy()));
+  timer_.Restart();
+}
+
 // TODO: add support for non-blocking read.
 int32 TcpController::ReadData(byte* buf, int32 size) {
   // {
@@ -539,18 +576,22 @@ int32 TcpController::WriteData(const byte* buf, int32 size) {
     writen = send_buffer_.Write(buf, size);
   }
 
-  send_buffer_cv_.notify_one();
+  send_buffer_data_cv_.notify_one();
   return static_cast<int32>(writen);
 }
 
 void TcpController::SocketSendBufferListener() {
-  while (true) {
-    // User called Close() and TCP state transitted to FIN_WAIT_1, no more data
-    // should sent from now. This thread can safely exit.
+  while (!shutdown_.load()) {
+    // TCP in CLOSE_WAIT state, and it send buffer is cleared, CLOSE_WAIT
+    // should be ended, and no more data will be sent.
     {
-      std::unique_lock<std::mutex> lock_send_window(state_mutex_);
-      if (state_ == FIN_WAIT_1) {
-        break;
+      std::unique_lock<std::mutex> state_lock(state_mutex_);
+      if (state_ == CLOSE_WAIT) {
+        std::unique_lock<std::mutex> lock_send_buffer(send_buffer_mutex_);
+        if (send_buffer_.empty()) {
+          send_buffer_empty_cv_.notify_one();
+          return;
+        }
       }
     }
 
@@ -565,13 +606,31 @@ void TcpController::SocketSendBufferListener() {
     }
     lock_send_window.unlock();
 
+    // User called Close() and TCP state transitted to FIN_WAIT_1, no more data
+    // should sent from now.
+    {
+      std::unique_lock<std::mutex> state_lock(state_mutex_);
+      if (state_ == FIN_WAIT_1) {
+        return;
+      }
+    }
+
     // Wait for socket send buffer to have data to send.
     std::unique_lock<std::mutex> lock_send_buffer(send_buffer_mutex_);
-    send_buffer_cv_.wait(lock_send_buffer,
+    send_buffer_data_cv_.wait(lock_send_buffer,
         [this] { return shutdown_.load() || !send_buffer_.empty(); });
 
     if (shutdown_.load()) {
       return;
+    }
+
+    // User called Close() and TCP state transitted to FIN_WAIT_1, no more data
+    // should sent from now.
+    {
+      std::unique_lock<std::mutex> state_lock(state_mutex_);
+      if (state_ == FIN_WAIT_1) {
+        return;
+      }
     }
 
     // Lock send window again. Check free space again, because the window size
@@ -653,7 +712,7 @@ void TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
 }
 
 void TcpController::PacketSendBufferListener() {
-  while (true) {
+  while (!shutdown_.load()) {
     std::queue<std::unique_ptr<Packet>> packets_to_send;
     pkt_send_buffer_.DeQueueAllTo(&packets_to_send);
 

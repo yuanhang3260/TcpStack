@@ -182,7 +182,8 @@ void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
   // Release port.
   ReleasePort(tcp_key.dest_port);
 
-  LogINFO("Connection %s safely deleted ^_^", tcp_key.DebugString().c_str());
+  debuginfo(Strings::StrCat(
+      "Connection ", tcp_key.DebugString(), " safely deleted ^_^"));
 }
 
 int32 Host::ReadData(int32 socket_fd, byte* buffer, int32 size) {

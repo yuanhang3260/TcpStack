@@ -73,12 +73,16 @@ Packet* Packet::Copy() const {
 
 std::string Packet::DebugString() const {
   std::string debug_msg = tcp_header_.ack ?
-      "ack " + std::to_string(tcp_header_.ack_num) + ", ": "";
+      "ack " + std::to_string(tcp_header_.ack_num): "";
 
   if (tcp_header_.sync) {
-    debug_msg += ("sync " + std::to_string(tcp_header_.seq_num));
-  } else if (payload_size_ > 0) {
-    debug_msg += ("send " + std::to_string(tcp_header_.seq_num));
+    debug_msg += ", sync";
+  } else if (tcp_header_.fin) {
+    debug_msg += ", fin";
+  } 
+
+  if (payload_size_ > 0) {
+    debug_msg += (", seq " + std::to_string(tcp_header_.seq_num));
   } else if (!tcp_header_.ack) {
     // If not a ack packet, and payload size is zero, it's a receive window
     // size prober.

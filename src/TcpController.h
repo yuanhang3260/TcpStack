@@ -53,8 +53,8 @@ struct TcpControllerKey {
   }
 
   std::string DebugString() const {
-    return Strings::StrCat("{", source_ip, ", ", std::to_string(source_port),
-                           ", ", dest_ip, ", ", std::to_string(dest_port), "}");
+    return Strings::StrCat("{", source_ip, ":", std::to_string(source_port),
+                           ", ", dest_ip, ":", std::to_string(dest_port), "}");
   }
 };
 
@@ -123,7 +123,7 @@ class TcpController {
   int32 ReadData(byte* buf, int32 size);
   int32 WriteData(const byte* buf, int32 size);
 
-  // Connect to remote host. It sends a SYNC segment.
+  // Connect to remote host. It sends a SYN segment.
   bool TryConnect();
 
   // Close a TCP connection. It sends a FIN segment.
@@ -141,6 +141,11 @@ class TcpController {
   // These methods serve uplink packet/data delivery (receive data).
   void PacketReceiveBufferListner();
   void HandleReceivedPackets(std::queue<std::unique_ptr<Packet>>* new_packets);
+  bool HandleACK(std::unique_ptr<Packet> pkt);
+  bool HandleSYN(std::unique_ptr<Packet> pkt);
+  bool HandleACKSYN(std::unique_ptr<Packet> pkt);
+  bool HandleFIN(std::unique_ptr<Packet> pkt);
+  bool HandleDataPacket(std::unique_ptr<Packet> pkt);
   void StreamDataToReceiveBuffer(
       std::shared_ptr<RecvWindow::RecvWindowNode> received_pkt_nodes);
 
@@ -153,6 +158,8 @@ class TcpController {
   // become non-empty, and push overflowed packets into it.
   void SocketReceiveBufferListener();
   void PushOverflowedPacketsToSocketBuffer();
+
+  void DoCloseWait();
 
   // Timeout callback.
   void TimeoutReTransmitter();
@@ -205,8 +212,9 @@ class TcpController {
   // Socket send buffer.
   Utility::RingBuffer send_buffer_;
   std::mutex send_buffer_mutex_;
-  std::condition_variable send_buffer_cv_;
-  std::condition_variable send_buffer_write_cv_;
+  std::condition_variable send_buffer_data_cv_;  // send buffer has data
+  std::condition_variable send_buffer_write_cv_; // send buffer has space
+  std::condition_variable send_buffer_empty_cv_; // send buffer is empty
   // Send window.
   SendWindow send_window_;
   std::mutex send_window_mutex_;
