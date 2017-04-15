@@ -63,7 +63,7 @@ TcpControllerOptions TcpController::GetDefaultOptions() {
 TcpController::~TcpController() {
 }
 
-void TcpController::ShutDown() {
+void TcpController::TearDown() {
   if (shutdown_.load()) {
     return;
   }
@@ -98,20 +98,19 @@ bool TcpController::TryConnect() {
     }
   }
   
+  // TCP state = SYN_SENT;
   {
     std::unique_lock<std::mutex> state_lock(state_mutex_);
     state_ = SYN_SENT;
   }
 
-  // Send the sync packet (1st handshake), and wait for remote host's
-  // SYN_ACK segment (2nd handshake).
-  //
-  // Here we simply wait for TCP state transitted to ESTABLISHED.
+  // Send the sync packet (1st handshake), and wait in state SYN_SENT for
+  // ACK_SYN from server. Before that happens, user can call socket Write() to
+  // write data into socket buffer and return success, but no data will be
+  // really sent to network until ACK_SYN is received and TCP state transitted
+  // to ESTABLISHED.
   SendPacket(std::unique_ptr<Packet>(sync_pkt->Copy()));
   timer_.Restart();
-
-  std::unique_lock<std::mutex> state_lock(state_mutex_);
-  state_cv_.wait(state_lock, [&] { return state_ == ESTABLISHED; });
 
   return true;
 }
@@ -120,30 +119,22 @@ bool TcpController::TryClose() {
   {
     std::unique_lock<std::mutex> state_lock(state_mutex_);
     // The connection is already into closing states.
-    if (state_ == CLOSE_WAIT || state_ == LAST_ACK || state_ == CLOSED) {
+    if (state_ == LAST_ACK || state_ == CLOSED) {
       return true;
-    }
-    if (state_ != ESTABLISHED) {
-      LogERROR("TCP state is not ESTABLISHED, can't Close");
-      return false;
     }
   }
 
-  // Send FIN segment.
+  // TODO: Set socket state to prevent further user call of Write().
+
+  // Send FIN segment. It waits for socket send buffer to be cleared and then
+  // enqueue the FIN segment.
   SendFIN();
-
-  // Wait for TCP status transitted to TIME_WAIT. This state can last a
-  // relatively long time (~1 minute), but Close() can safely return in this
-  // TCP state. When TCP state finally transitted to CLOSED, all connection
-  // resource (port, buffer, etc) will be released by host system.
-
-  // std::unique_lock<std::mutex> state_lock(state_mutex_);
-  // state_cv_.wait(state_lock, [&] { return state_ == TIME_WAIT; });
 
   return true;
 }
 
 void TcpController::SendFIN() {
+  debuginfo("Sending FIN...");
   // Sending FIN needs to wait for socket send buffer to become empty.
   {
     std::unique_lock<std::mutex> lock_send_window(send_buffer_mutex_);
@@ -202,8 +193,8 @@ bool TcpController::HandleDataPacket(std::unique_ptr<Packet> pkt) {
     return true;
   }
 
-  // If already received fin, there should be no more data packets received.
-  if (fin_received_.load()) {
+  // If already received FIN, there should be no more data packets after FIN.
+  if (fin_received_.load() && pkt->tcp_header().seq_num > fin_seq_) {
     // Ack FIN ?
     return true;
   }
@@ -216,7 +207,7 @@ bool TcpController::HandleDataPacket(std::unique_ptr<Packet> pkt) {
   // If FIN has been queued in receive window, and now all data packets before
   // it has been received and to be delivered to upper layer. We're ready to
   // transit to CLOSE_WAIT state.
-  if (fin_received_.load() || pair.first == fin_seq_.load()) {
+  if (fin_received_.load() || pair.first == fin_seq_.load() + 1) {
     SANITY_CHECK(recv_window_.empty(),
                  "Receive window should be empty after FIN has been processed");
     std::unique_lock<std::mutex> state_lock(state_mutex_);
@@ -303,7 +294,10 @@ bool TcpController::HandleSYN(std::unique_ptr<Packet> pkt) {
   SendPacket(std::unique_ptr<Packet>(sync_ack_pkt->Copy()));
   timer_.Restart();
 
-  // Server's TCP state transition.
+  // Server's TCP state transit to SYN_RCVD. For now, server can call socket
+  // Write() to write data into socket buffer, but no data packet will be
+  // actually sent. It must wait for the final ACK (3rd handshake from client)
+  // and transit to TCP state ESTABLISHED, before sending any data packet.
   {
     std::unique_lock<std::mutex> state_lock(state_mutex_);
     state_ = SYN_RCVD;
@@ -375,7 +369,8 @@ bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
     debuginfo("Got FIN 1");
     // If receive window is cleared (last packet is FIN_1), we can transit
     // to CLOSE_WAIT state.
-    if (pair.first == seq_num) {
+    if (pair.first == seq_num + 1) {
+      debuginfo("into CLOSE_WAIT");
       SANITY_CHECK(recv_window_.empty(),
           "Receive window should be empty after FIN has been processed");
       state_ = CLOSE_WAIT;
@@ -385,15 +380,13 @@ bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
     }
   } else if (state_ == FIN_WAIT_2) {
     debuginfo("Got FIN 2");
-    // Notify the thread waiting on Close().
     state_ = TIME_WAIT;
-    state_cv_.notify_one();
 
     // Wait for 2 * MSL (typically it should last 1 ~ 2 minutes), and terminate
     // this TCP connection.
     std::thread shut_down([&] {
-      std::this_thread::sleep_for(std::chrono::seconds(20));
-      ShutDown();
+      std::this_thread::sleep_for(std::chrono::seconds(10));
+      TearDown();
       // Notify host to delete this connection and all its resource,
       // after current thread exits. This should be the last thread bound
       // of this connection object.
@@ -439,6 +432,7 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
   if (send_window_.free_space() > 0 || send_window_.capacity() == 0) {
     send_window_cv_.notify_one();
   }
+  bool send_window_empty = (send_window_.NumPacketsToAck() == 0);
   send_window_lock.unlock();
 
   // Here we need to handle some special acks for TCP handshake and wavebye.
@@ -448,17 +442,19 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
     // connection is ready to send data.
     state_ = ESTABLISHED;
     debuginfo("Server --> Client connection established ^_^");
-  } else if (state_ == FIN_WAIT_1) {
-    // Received ACK for FIN_WAIT_1, transit to FIN_WAIT_2.
+    state_cv_.notify_one();
+  } else if (state_ == FIN_WAIT_1 && send_window_empty) {
+    // Received ACK for FIN_WAIT_1, transit to FIN_WAIT_2. Note that we must
+    // check if send window is cleared, with last packet (FIN) been acked.
     debuginfo("Got ACK for FIN 1");
     state_ = FIN_WAIT_2;
-  } else if (state_ == LAST_ACK) {
+  } else if (state_ == LAST_ACK && send_window_empty) {
     debuginfo("Got LAST_ACK");
     // Received last ack. This TCP connection can finally be closed.
     state_ = CLOSED;
 
     std::thread shut_down([&] {
-      ShutDown();
+      TearDown();
       // Notify host to delete this connection and all its resource,
       // after current thread exits. This should be the last thread bound
       // of this connection object.
@@ -591,13 +587,13 @@ int32 TcpController::ReadData(byte* buf, int32 size) {
 }
 
 int32 TcpController::WriteData(const byte* buf, int32 size) {
-  {
-    std::unique_lock<std::mutex> lock(state_mutex_);
-    if (state_ != ESTABLISHED) {
-      LogERROR("TCP state not in ESTABLISHED, cannot send data");
-      return -1;
-    }
-  }
+  // {
+  //   std::unique_lock<std::mutex> lock(state_mutex_);
+  //   if (state_ != ESTABLISHED) {
+  //     LogERROR("TCP state not in ESTABLISHED, cannot send data");
+  //     return -1;
+  //   }
+  // }
 
   uint32 writen = 0;
   {
@@ -613,19 +609,22 @@ int32 TcpController::WriteData(const byte* buf, int32 size) {
 }
 
 void TcpController::SocketSendBufferListener() {
-  while (!shutdown_.load()) {
-    // TCP in CLOSE_WAIT state, and it send buffer is cleared, CLOSE_WAIT
-    // should be ended, and no more data will be sent.
-    {
-      std::unique_lock<std::mutex> state_lock(state_mutex_);
-      if (state_ == CLOSE_WAIT) {
-        std::unique_lock<std::mutex> lock_send_buffer(send_buffer_mutex_);
-        if (send_buffer_.empty()) {
-          send_buffer_empty_cv_.notify_one();
-          return;
-        }
-      }
+  // Wait for TCP connection to be established.
+  //
+  // Specifically, this is for client to wait in SYN_SENT state , and for
+  // server to wait in SYN_RCVD state. They must receive ACK for their SYN,
+  // and then transit to state ESTABLISHED respectively, before sending any
+  // data packets.
+  {
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    state_cv_.wait(state_lock, [&] { return shutdown_.load() ||
+                                            !InConnectingState(); });
+    if (shutdown_.load()) {
+      return;
     }
+  }
+
+  while (!shutdown_.load()) {
 
     // Wait for send window to be not full.
     std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
@@ -638,15 +637,6 @@ void TcpController::SocketSendBufferListener() {
     }
     lock_send_window.unlock();
 
-    // User called Close() and TCP state transitted to FIN_WAIT_1, no more data
-    // should sent from now.
-    {
-      std::unique_lock<std::mutex> state_lock(state_mutex_);
-      if (state_ == FIN_WAIT_1) {
-        return;
-      }
-    }
-
     // Wait for socket send buffer to have data to send.
     std::unique_lock<std::mutex> lock_send_buffer(send_buffer_mutex_);
     send_buffer_data_cv_.wait(lock_send_buffer,
@@ -654,15 +644,6 @@ void TcpController::SocketSendBufferListener() {
 
     if (shutdown_.load()) {
       return;
-    }
-
-    // User called Close() and TCP state transitted to FIN_WAIT_1, no more data
-    // should sent from now.
-    {
-      std::unique_lock<std::mutex> state_lock(state_mutex_);
-      if (state_ == FIN_WAIT_1) {
-        return;
-      }
     }
 
     // Lock send window again. Check free space again, because the window size
@@ -857,6 +838,10 @@ void TcpController::WaitForReadyToDestroy() {
   // Wait for destroy signal.
   std::unique_lock<std::mutex> lock(destroy_mutex_);
   destroy_cv_.wait(lock, [&] { return destroy_; });
+}
+
+bool TcpController::InConnectingState() {
+  return state_ == CLOSED || state_ == SYN_SENT || state_ == SYN_RCVD;
 }
 
 std::string TcpController::TcpStateStr(TCP_STATE state) {

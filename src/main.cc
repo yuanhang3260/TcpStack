@@ -103,16 +103,11 @@ int main(int argc, char** argv) {
     // Receive data from server, verify bytes are flipped.
     uint32 readn = 0;
     byte client_buffer[kTestDataSize];
-    while (true) {
+    while (readn < kTestDataSize) {
       auto re = alice.ReadData(sock_fd, client_buffer + readn, kTestDataSize);
       if (re > 0) {
         readn += re;
       }
-      if (re == 0) {
-        LogINFO("Server closed socket");
-        break;
-      }
-      //printf("readn = %d\n", readn);
     }
     if (readn != kTestDataSize) {
       LogERROR("Alice received %d bytes data\n", readn);

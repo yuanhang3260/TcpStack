@@ -129,8 +129,8 @@ class TcpController {
   // Close a TCP connection. It sends a FIN segment.
   bool TryClose();
 
-  // Shut down this connection. It stops all threads of this connection object.
-  void ShutDown();
+  // Terminate this connection. It stops all threads of this connection object.
+  void TearDown();
 
   // This is called by host to wait for this connection object can be deleted.
   void WaitForReadyToDestroy();
@@ -176,6 +176,8 @@ class TcpController {
   std::shared_ptr<Packet> MakeFinPacket(uint32 seq_num);
 
   std::string TcpStateStr(TCP_STATE state);
+
+  bool InConnectingState();
 
   void debuginfo(const std::string& msg);
 
