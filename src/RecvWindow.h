@@ -32,6 +32,8 @@ class RecvWindow : public TcpWindow {
 
   uint32 capacity() const { return capacity_; }
 
+  bool empty() const { return !head_->next; }
+
  private:
   // Receive base. This is the next seq number expected to receive.
   uint32 recv_base_ = 0;

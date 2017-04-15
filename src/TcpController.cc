@@ -36,6 +36,7 @@ TcpController::TcpController(Host* host,
            std::bind(&TcpController::TimeoutReTransmitter, this)) {
   state_ = CLOSED;
   socket_status_.store(OPEN);
+  fin_received_.store(false);
 
   timer_.SetRepeat(true);
 
@@ -128,33 +129,50 @@ bool TcpController::TryClose() {
     }
   }
 
+  // Send FIN segment.
+  SendFIN();
+
+  // Wait for TCP status transitted to TIME_WAIT. This state can last a
+  // relatively long time (~1 minute), but Close() can safely return in this
+  // TCP state. When TCP state finally transitted to CLOSED, all connection
+  // resource (port, buffer, etc) will be released by host system.
+
+  // std::unique_lock<std::mutex> state_lock(state_mutex_);
+  // state_cv_.wait(state_lock, [&] { return state_ == TIME_WAIT; });
+
+  return true;
+}
+
+void TcpController::SendFIN() {
+  // Sending FIN needs to wait for socket send buffer to become empty.
+  {
+    std::unique_lock<std::mutex> lock_send_window(send_buffer_mutex_);
+    send_buffer_empty_cv_.wait(lock_send_window,
+        [this] { return send_buffer_.empty(); });
+  }
+
+  // Send FIN and transit TCP state.
   std::shared_ptr<Packet> fin_pkt;
   {
     std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
     fin_pkt = MakeFinPacket(send_window_.NextSeqNumberToSend());
     if (!send_window_.SendPacket(fin_pkt)) {
       LogFATAL("Failed to send FIN segment");
-      return false;
     }
   }
-
-  // Need to set TCP state here, before really sending the FIN segment.
-  // Otherwise it can over-write following states (FIN_WAIT_2, TIME_WAIT).
   {
     std::unique_lock<std::mutex> state_lock(state_mutex_);
-    state_ = FIN_WAIT_1;
+    if (state_ == ESTABLISHED) {
+      state_ = FIN_WAIT_1;
+    } else if (state_ == CLOSE_WAIT) {
+      state_ = LAST_ACK;
+    } else {
+      LogERROR("Can't send FIN at TCP state %s", TcpStateStr(state_).c_str());
+      return;
+    }
   }
   SendPacket(std::unique_ptr<Packet>(fin_pkt->Copy()));
   timer_.Restart();
-
-  // Wait for TCP status transitted to TIME_WAIT. This state can last a
-  // relatively long time (~1 minute), but Close() can safely return in this
-  // TCP state. When TCP state finally transitted to CLOSED, all connection
-  // resource (port, buffer, etc) will be released by host system.
-  std::unique_lock<std::mutex> state_lock(state_mutex_);
-  state_cv_.wait(state_lock, [&] { return state_ == TIME_WAIT; });
-
-  return true;
 }
 
 // This method just enqueue the new packets into this TCP connection's private
@@ -177,10 +195,16 @@ void TcpController::PacketReceiveBufferListner() {
 }
 
 bool TcpController::HandleDataPacket(std::unique_ptr<Packet> pkt) {
+  // If this is a zero-size data packet, sender is probing receive window
+  // size.
   if (pkt->payload_size() == 0) {
-    // This is a zero-size data packet. Sender is probing receive window
-    // size.
     SendPacket(std::move(MakeAckPacket(recv_window_.recv_base())));
+    return true;
+  }
+
+  // If already received fin, there should be no more data packets received.
+  if (fin_received_.load()) {
+    // Ack FIN ?
     return true;
   }
 
@@ -188,8 +212,22 @@ bool TcpController::HandleDataPacket(std::unique_ptr<Packet> pkt) {
   // buffer) if avaible, and sends ack packet back to sender.
   auto pair = recv_window_.ReceivePacket(std::move(pkt));
   StreamDataToReceiveBuffer(pair.second);
-  SendPacket(std::move(MakeAckPacket(pair.first)));
 
+  // If FIN has been queued in receive window, and now all data packets before
+  // it has been received and to be delivered to upper layer. We're ready to
+  // transit to CLOSE_WAIT state.
+  if (fin_received_.load() || pair.first == fin_seq_.load()) {
+    SANITY_CHECK(recv_window_.empty(),
+                 "Receive window should be empty after FIN has been processed");
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    state_ = CLOSE_WAIT;
+
+    // Notify blocking Read() to return 0.
+    socket_status_.store(EOF_NOT_READ);
+    recv_buffer_read_cv_.notify_one();
+  }
+
+  SendPacket(std::move(MakeAckPacket(pair.first)));
   return true;
 }
 
@@ -312,28 +350,47 @@ bool TcpController::HandleACKSYN(std::unique_ptr<Packet> pkt) {
 bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
   // FIN segment. Ack this segment, and transit TCP state.
 
+  // If TCP is in state FIN_WAIT_1, it's waiting for ACK_FIN from the other
+  // side. Since it's not in FIN_WAIT_2 state yet, it can't accept a FIN. Just
+  // drop this segment.
+  {
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    if (state_ == FIN_WAIT_1) {
+      return true;
+    }
+  }
+
   // Deliver this FIN packet to upper level to notify blocking Read().
+  uint32 seq_num = pkt->tcp_header().seq_num;
   auto pair = recv_window_.ReceivePacket(std::move(pkt));
   StreamDataToReceiveBuffer(pair.second);
 
   // Ack this FIN, and transit TCP state.
+  fin_seq_.store(seq_num);
+  fin_received_.store(true);
   std::unique_lock<std::mutex> state_lock(state_mutex_);
   if (state_ == ESTABLISHED) {
     // CLOSE_WAIT state waits for socket send buffer to become empty, and
     // then send FIN back to the other side.
     debuginfo("Got FIN 1");
-    state_ = CLOSE_WAIT;
-    thread_pool_.AddTask([&] {
-      DoCloseWait();
-    });
+    // If receive window is cleared (last packet is FIN_1), we can transit
+    // to CLOSE_WAIT state.
+    if (pair.first == seq_num) {
+      SANITY_CHECK(recv_window_.empty(),
+          "Receive window should be empty after FIN has been processed");
+      state_ = CLOSE_WAIT;
+      // Notify blocking Read() to return 0.
+      socket_status_.store(EOF_NOT_READ);
+      recv_buffer_read_cv_.notify_one();
+    }
   } else if (state_ == FIN_WAIT_2) {
     debuginfo("Got FIN 2");
     // Notify the thread waiting on Close().
     state_ = TIME_WAIT;
     state_cv_.notify_one();
 
-    // Wait for 2 seconds (in reality TIME_WAIT should last 1 ~ 2 minutes),
-    // and destroy this TCP connection.
+    // Wait for 2 * MSL (typically it should last 1 ~ 2 minutes), and terminate
+    // this TCP connection.
     std::thread shut_down([&] {
       std::this_thread::sleep_for(std::chrono::seconds(20));
       ShutDown();
@@ -440,7 +497,7 @@ void TcpController::StreamDataToReceiveBuffer(
       }
 
       if (pkt->tcp_header().fin) {
-        socket_status_.store(EOF_NOT_READ);
+        // FIN receivd. No more data should be delivered to upper layer.
         break;
       }
 
@@ -493,31 +550,6 @@ void TcpController::PushOverflowedPacketsToSocketBuffer() {
       break;
     }
   }
-}
-
-void TcpController::DoCloseWait() {
-  // CLOSE_WAIT wait for send buffer to become empty, and then send FIN.
-  {
-    std::unique_lock<std::mutex> lock_send_window(send_buffer_mutex_);
-    send_buffer_empty_cv_.wait(lock_send_window,
-        [this] { return send_buffer_.empty(); });
-  }
-
-  // Send FIN and transit TCP state to LAST_ACK.
-  std::shared_ptr<Packet> fin_pkt;
-  {
-    std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
-    fin_pkt = MakeFinPacket(send_window_.NextSeqNumberToSend());
-    if (!send_window_.SendPacket(fin_pkt)) {
-      LogFATAL("Failed to send FIN segment");
-    }
-  }
-  {
-    std::unique_lock<std::mutex> state_lock(state_mutex_);
-    state_ = LAST_ACK;
-  }
-  SendPacket(std::unique_ptr<Packet>(fin_pkt->Copy()));
-  timer_.Restart();
 }
 
 // TODO: add support for non-blocking read.
@@ -825,6 +857,22 @@ void TcpController::WaitForReadyToDestroy() {
   // Wait for destroy signal.
   std::unique_lock<std::mutex> lock(destroy_mutex_);
   destroy_cv_.wait(lock, [&] { return destroy_; });
+}
+
+std::string TcpController::TcpStateStr(TCP_STATE state) {
+  switch (state_) {
+    case CLOSED: return "CLOSED";
+    case SYN_SENT: return "SYN_SENT";
+    case ESTABLISHED: return "ESTABLISHED";
+    case LISTEN: return "LISTEN";
+    case SYN_RCVD: return "SYN_RCVD";
+    case FIN_WAIT_1: return "FIN_WAIT_1";
+    case FIN_WAIT_2: return "FIN_WAIT_2";
+    case TIME_WAIT: return "TIME_WAIT";
+    case CLOSE_WAIT: return "CLOSE_WAIT";
+    case LAST_ACK: return "LAST_ACK";
+    default: return "UNKNOWN_TCP_STATE";
+  }
 }
 
 }  // namespace net_stack

@@ -159,7 +159,7 @@ class TcpController {
   void SocketReceiveBufferListener();
   void PushOverflowedPacketsToSocketBuffer();
 
-  void DoCloseWait();
+  void SendFIN();
 
   // Timeout callback.
   void TimeoutReTransmitter();
@@ -174,6 +174,8 @@ class TcpController {
   std::shared_ptr<Packet> MakeSyncPacket(uint32 seq_num);
 
   std::shared_ptr<Packet> MakeFinPacket(uint32 seq_num);
+
+  std::string TcpStateStr(TCP_STATE state);
 
   void debuginfo(const std::string& msg);
 
@@ -190,6 +192,8 @@ class TcpController {
   // Recv window. No mutex needed. Only PacketReceiveBufferListner thread
   // use it.
   RecvWindow recv_window_;
+  std::atomic_bool fin_received_;
+  std::atomic_uint fin_seq_;
   // Socket receive buffer.
   Utility::RingBuffer recv_buffer_;
   std::mutex recv_buffer_mutex_;
