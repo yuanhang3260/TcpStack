@@ -19,6 +19,17 @@
 
 namespace net_stack {
 
+struct Socket {
+  Socket(int32 file_descriptor) : fd(file_descriptor),
+                                  state(OPEN),
+                                  tcp_con(nullptr) {}
+
+  int32 fd;
+  SocketState state;
+  TcpController* tcp_con;
+  std::mutex mutex_;
+};
+
 class Host {
  public:
   Host(const std::string& hostname, const std::string& ip_address,
@@ -33,10 +44,6 @@ class Host {
   // send queue.
   void MultiplexPacketsFromTcp(
       std::queue<std::unique_ptr<Packet>>* packets_to_send);
-
-  // TODO: Make this private.
-  void CreateTcpConnection(const std::string& source_ip, uint32 source_port,
-                           uint32 local_port, uint32 socket_fd);
 
   // Remove a tcp connection and release all its resource.
   void DeleteTcpConnection(const TcpControllerKey& tcp_key);
@@ -54,6 +61,7 @@ class Host {
   bool Listen(int32 sock_fd);
   int Accept(int32 sock_fd);
 
+  bool ShutDown(int32 sock_fd);
   bool Close(int32 sock_fd);
 
   std::string hostname() const { return hostname_; }
@@ -69,6 +77,8 @@ class Host {
   void PacketsSendListener();
 
   bool HandleNewConnection(const Packet& pkt);
+
+  void SendBackRST(TcpControllerKey tcp_key);
 
   // Get next available file descriptor.
   int32 GetFileDescriptor();
@@ -96,13 +106,13 @@ class Host {
   TcpConnectionMap connections_;
   std::mutex connections_mutex_;
 
-  // This map maintains socket fd --> TcpController
-  std::unordered_map<int32, TcpController*> socket_tcp_map_;
-  std::mutex socket_tcp_map_mutex_;
-
   // All available file descriptors.
   std::set<int32> fd_pool_;
   std::mutex fd_pool_mutex_;
+
+  // All sockets currently mapped to file descriptor.
+  std::unordered_map<int32, std::shared_ptr<net_stack::Socket>> sockets_;
+  std::mutex sockets_mutex_;
 
   // All available ports.
   std::set<uint32> port_pool_;

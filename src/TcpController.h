@@ -10,6 +10,7 @@
 #include <unordered_map>
 
 #include "BaseChannel.h"
+#include "Common.h"
 #include "PacketQueue.h"
 #include "RecvWindow.h"
 #include "SendWindow.h"
@@ -22,6 +23,7 @@
 namespace net_stack {
 
 class Host;
+class Socket;
 
 // TCP uses <source_ip, source_port, dest_ip, dest_port> as unique indentifier.
 struct TcpControllerKey {
@@ -110,7 +112,8 @@ class TcpController {
     LAST_ACK,
   };
 
-  TcpController(Host* host, const TcpControllerKey& tcp_id, int32 socket_fd,
+  TcpController(Host* host, const TcpControllerKey& tcp_id,
+                std::shared_ptr<net_stack::Socket> socket_,
                 const TcpControllerOptions& options);
   ~TcpController();
 
@@ -126,8 +129,8 @@ class TcpController {
   // Connect to remote host. It sends a SYN segment.
   bool TryConnect();
 
-  // Close a TCP connection. It sends a FIN segment.
-  bool TryClose();
+  // Shut down a TCP connection. It sends a FIN segment.
+  bool TryShutDown();
 
   // Terminate this connection. It stops all threads of this connection object.
   void TearDown();
@@ -135,7 +138,7 @@ class TcpController {
   // This is called by host to wait for this connection object can be deleted.
   void WaitForReadyToDestroy();
 
-  int32 socket_fd() const { return socket_fd_; }
+  int32 socket_fd() const;
 
  private:
   // These methods serve uplink packet/data delivery (receive data).
@@ -145,6 +148,7 @@ class TcpController {
   bool HandleSYN(std::unique_ptr<Packet> pkt);
   bool HandleACKSYN(std::unique_ptr<Packet> pkt);
   bool HandleFIN(std::unique_ptr<Packet> pkt);
+  bool HandleRst();
   bool HandleDataPacket(std::unique_ptr<Packet> pkt);
   void StreamDataToReceiveBuffer(
       std::shared_ptr<RecvWindow::RecvWindowNode> received_pkt_nodes);
@@ -161,6 +165,8 @@ class TcpController {
 
   void SendFIN();
 
+  void CloseAndDelete();
+
   // Timeout callback.
   void TimeoutReTransmitter();
 
@@ -175,15 +181,18 @@ class TcpController {
 
   std::shared_ptr<Packet> MakeFinPacket(uint32 seq_num);
 
+  std::unique_ptr<Packet> MakeRstPacket();
+
   std::string TcpStateStr(TCP_STATE state);
 
   bool InConnectingState();
+  bool InClosingState();
 
   void debuginfo(const std::string& msg);
 
   Host* host_ = nullptr;
   TcpControllerKey key_;
-  int32 socket_fd_;
+  std::shared_ptr<net_stack::Socket> socket_;
 
   Executors::FixedThreadPool thread_pool_;
 
@@ -202,12 +211,13 @@ class TcpController {
   std::condition_variable recv_buffer_read_cv_;
   std::condition_variable recv_buffer_write_cv_;
 
-  enum SocketStatus {
+  enum PipeState {
     OPEN,
-    EOF_NOT_READ,
     EOF_READ,
+    EOF_NOT_READ,
   };
-  std::atomic<SocketStatus> socket_status_;
+  std::atomic<PipeState> pipe_state_;
+
   // This is a temporary queue to store overflowed packets when socket receive
   // buffer is full. This is for a corner case of flow control. When receive
   // window size is 0, sender will continue sending packets with size 1 byte.

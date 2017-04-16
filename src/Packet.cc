@@ -87,8 +87,8 @@ std::string Packet::DebugString() const {
 
   if (payload_size_ > 0) {
     flags.push_back("Seq " + std::to_string(tcp_header_.seq_num));
-  } else if (!tcp_header_.ack) {
-    // If not a ack packet, and payload size is zero, it's a receive window
+  } else if (!tcp_header_.ack && !tcp_header_.rst) {
+    // If not a ack/rst packet, and payload size is zero, it's a receive window
     // size prober.
     flags.push_back("probing window size");
   }

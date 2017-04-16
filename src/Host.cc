@@ -63,16 +63,34 @@ void Host::DemultiplexPacketsToTcps(
     if (it == connections_.end()) {
       if (!HandleNewConnection(*pkt)) {
         LogERROR("%s: Can't find tcp connection %s, "
-                 "and neither is there any listener on {%s, %u}",
+                 "and neither is there any listener on {%s:%u}",
                  hostname_.c_str(), tcp_key.DebugString().c_str(),
                  pkt->ip_header().source_ip.c_str(),
                  pkt->tcp_header().source_port);
+        // Send RST to the other side.
+        if (!pkt->tcp_header().rst) {
+          SendBackRST(tcp_key);
+        }
         continue;
       }
     }
     connections_.at(tcp_key)->ReceiveNewPacket(std::move(pkt));
     new_packets->pop();
   }
+}
+
+void Host::SendBackRST(TcpControllerKey tcp_key) {
+  IPHeader ip_header;
+  ip_header.source_ip = tcp_key.source_ip;
+  ip_header.dest_ip = tcp_key.dest_ip;
+
+  TcpHeader tcp_header;
+  tcp_header.source_port = tcp_key.source_port;
+  tcp_header.dest_port = tcp_key.dest_port;
+  tcp_header.rst = true;
+
+  std::unique_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
+  send_pkt_queue_.Push(std::move(pkt));
 }
 
 bool Host::HandleNewConnection(const Packet& pkt) {
@@ -98,18 +116,26 @@ bool Host::HandleNewConnection(const Packet& pkt) {
                            pkt.ip_header().source_ip,
                            pkt.tcp_header().source_port};
 
+  // Create Socket object.
   int32 new_fd = GetFileDescriptor();
+  std::shared_ptr<net_stack::Socket> socket(new net_stack::Socket(new_fd));
+  {
+    std::unique_lock<std::mutex> sockets_lock(sockets_mutex_);
+    sockets_.emplace(new_fd, socket);
+  }
+
+  // Create TCP connection object.
   auto tcp_options = TcpController::GetDefaultOptions();
   // Set recv_base = sender's seq_num. This marks I'm expecting to receive the
   // first packet with exactly this seq_num. Client to server connection starts!
   tcp_options.recv_window_base = pkt.tcp_header().seq_num;
 
-  connections_.emplace(tcp_key,
-                       ptr::MakeUnique<TcpController>(
-                          this, tcp_key, new_fd, tcp_options));
   {
-    std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
-    socket_tcp_map_.emplace(new_fd, connections_.at(tcp_key).get());
+    std::unique_lock<std::mutex> connections_lock(connections_mutex_);
+    connections_.emplace(tcp_key,
+                         ptr::MakeUnique<TcpController>(
+                            this, tcp_key, socket, tcp_options));
+    socket->tcp_con = connections_.at(tcp_key).get();
   }
 
   // Notify Accept() to get the a new TCP connection socket.
@@ -134,20 +160,6 @@ void Host::PacketsSendListener() {
   }
 }
 
-void Host::CreateTcpConnection(const std::string& source_ip, uint32 source_port,
-                               uint32 local_port, uint32 socket_fd) {
-  std::unique_lock<std::mutex> connections_lock(connections_mutex_);
-  TcpControllerKey tcp_key{source_ip, source_port, ip_address_, local_port};
-  connections_.emplace(tcp_key,
-                       ptr::MakeUnique<TcpController>(
-                          this, tcp_key, socket_fd,
-                          TcpController::GetDefaultOptions()));
-  connections_lock.unlock();
-
-  std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
-  socket_tcp_map_.emplace(socket_fd, connections_.at(tcp_key).get());
-}
-
 void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
   // Remove from connection map.
   std::unique_lock<std::mutex> connections_lock(connections_mutex_);
@@ -157,22 +169,23 @@ void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
              tcp_key.DebugString().c_str());
     return;
   }
-  int32 socket_fd = it->second->socket_fd();
   connections_lock.unlock();
 
   // Wait for this connection is ready to be deleted. Don't wait inside any
   // lock of host.
   it->second->WaitForReadyToDestroy();
 
-  // Remove from socket connection map.
-  std::unique_lock<std::mutex> socket_tcp_map_lock(socket_tcp_map_mutex_);
-  auto it2 = socket_tcp_map_.find(socket_fd);
-  if (it2 == socket_tcp_map_.end()) {
-    LogERROR("Can't find TCP connection %s bound to any socket",
-             tcp_key.DebugString().c_str());
+  // Reset the socket. It now can be bound to other TCP connections (e.g. call
+  // Connect on the fd to create new TCP connection).
+  int32 socket_fd = it->second->socket_fd();
+  if (socket_fd > 0) {
+    std::unique_lock<std::mutex> lock(sockets_mutex_);
+    auto it = sockets_.find(socket_fd);
+    if (it != sockets_.end()) {
+      it->second->tcp_con = nullptr;
+      it->second->state = OPEN;
+    }
   }
-  socket_tcp_map_.erase(it2);
-  socket_tcp_map_lock.unlock();
 
   // Delete connection object.
   connections_lock.lock();
@@ -187,51 +200,67 @@ void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
 }
 
 int32 Host::ReadData(int32 socket_fd, byte* buffer, int32 size) {
+  TcpController* tcp_con;
+  SocketState socket_state;
   {
-    std::unique_lock<std::mutex> fd_pool_lock(fd_pool_mutex_);
-    if (fd_pool_.find(socket_fd) != fd_pool_.end()) {
-      LogERROR("Bad socket %d", socket_fd);
+    std::unique_lock<std::mutex> lock(sockets_mutex_);
+    auto it = sockets_.find(socket_fd);
+    if (it == sockets_.end()) {
+      LogERROR("Can't find socket %d", socket_fd);
       return -1;
     }
+    socket_state = it->second->state;
+    tcp_con = it->second->tcp_con;
   }
 
-  TcpController* tcp_con;
-  {
-    std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
-    auto it = socket_tcp_map_.find(socket_fd);
-    if (it == socket_tcp_map_.end()) {
-      LogERROR("Can't find tcp connection bind with socket %u", socket_fd);
-      return -1;
-    }
-    tcp_con = it->second;
+  // If socket state is closed, prevent user reading data from this socket.
+  // Note this check resides in socket layer.
+
+  // After FIN is sent, TCP layer's behavior on receiving new data depends on
+  // socket state. TCP layer needs to look at whether FIN is triggered by
+  // Close() or ShutDown(), by looking at current socket state. If FIN is sent
+  // by Close(), this TCP connection has no binding to user space anymore,
+  // and it should reply RST to the other side, indicating no more data is
+  // acceptable. If FIN is sent by ShutDown(), TCP connection can still receive
+  // data until the other side sends a FIN.
+  if (socket_state == CLOSED) {
+    LogERROR("Socket has been closed, can't recv data");
+    return -1;
   }
+
   return tcp_con->ReadData(buffer, size);
 }
 
 int32 Host::WriteData(int32 socket_fd, const byte* buffer, int32 size) {
+  TcpController* tcp_con;
+  SocketState socket_state;
   {
-    std::unique_lock<std::mutex> fd_pool_lock(fd_pool_mutex_);
-    if (fd_pool_.find(socket_fd) != fd_pool_.end()) {
-      LogERROR("Bad socket %d", socket_fd);
+    std::unique_lock<std::mutex> lock(sockets_mutex_);
+    auto it = sockets_.find(socket_fd);
+    if (it == sockets_.end()) {
+      LogERROR("Can't find socket %d", socket_fd);
       return -1;
     }
+    socket_state = it->second->state;
+    tcp_con = it->second->tcp_con;
   }
 
-  TcpController* tcp_con;
-  {
-    std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
-    auto it = socket_tcp_map_.find(socket_fd);
-    if (it == socket_tcp_map_.end()) {
-      LogERROR("Can't find tcp connection bind with socket %u", socket_fd);
-      return -1;
-    }
-    tcp_con = it->second;
+  // Prevent sending data after socket is closed or shutdown. Note this check
+  // resides in socket layer rather TCP layer. As a double check, TCP also
+  // checks TCP state and blocks sending data if FIN is already sent.
+  if (socket_state == SHUTDOWN || socket_state == CLOSED) {
+    LogERROR("Socket has been shut down, can't send data");
+    return -1;
   }
+
   return tcp_con->WriteData(buffer, size);
 }
 
 int32 Host::Socket() {
-  return GetFileDescriptor();
+  int32 fd = GetFileDescriptor();
+  std::unique_lock<std::mutex> lock(sockets_mutex_);
+  sockets_.emplace(fd, ptr::MakeUnique<net_stack::Socket>(fd));
+  return fd;
 }
 
 bool Host::Bind(int32 sock_fd,
@@ -308,6 +337,17 @@ bool Host::Connect(int32 sock_fd,
     }
   }
 
+  std::shared_ptr<net_stack::Socket> socket;
+  {
+    std::unique_lock<std::mutex> sockets_lock(sockets_mutex_);
+    auto it = sockets_.find(sock_fd);
+    if (it == sockets_.end()) {
+      LogERROR("fd %d is not socket", sock_fd);
+      return false;
+    }
+    socket = it->second;
+  }
+
   // Create TcpController and try establishing TCP connection with remote host.
   // Note remote host is the "source" part in TcpControllerKey.
   TcpControllerKey tcp_key{remote_ip, remote_port, 
@@ -316,13 +356,9 @@ bool Host::Connect(int32 sock_fd,
   tcp_options.send_window_base = 0;  /* Utils::RandomNumber(); */
   connections_.emplace(tcp_key,
                        ptr::MakeUnique<TcpController>(
-                          this, tcp_key, sock_fd, tcp_options));
+                          this, tcp_key, socket, tcp_options));
   auto tcp_con = connections_.at(tcp_key).get();
-
-  {
-    std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
-    socket_tcp_map_.emplace(sock_fd, tcp_con);
-  }
+  socket->tcp_con = tcp_con;
 
   // Clean up steps.
   auto clean_up = Utility::CleanUp([&]() {
@@ -340,28 +376,67 @@ bool Host::Connect(int32 sock_fd,
   return true;
 }
 
-bool Host::Close(int32 sock_fd) {
+bool Host::ShutDown(int32 sock_fd) {
   TcpController* tcp_con = nullptr;
   {
-    std::unique_lock<std::mutex> lock(socket_tcp_map_mutex_);
-    auto it = socket_tcp_map_.find(sock_fd);
-    if (it == socket_tcp_map_.end()) {
-      LogERROR("Can't find tcp connection bind with socket %u", sock_fd);
-      return -1;
+    std::unique_lock<std::mutex> lock(sockets_mutex_);
+    auto it = sockets_.find(sock_fd);
+    if (it == sockets_.end()) {
+      LogERROR("Can't find socket %u", sock_fd);
+      return false;
     }
-    tcp_con = it->second;
+    auto socket = it->second.get();
+    tcp_con = socket->tcp_con;
+    socket->state = SHUTDOWN;
   }
 
-  auto re = tcp_con->TryClose();
+  // Tcp connection shutdown - It sends FIN to the other side.
+  auto re = tcp_con->TryShutDown();
   if (!re) {
     // TODO: Close fail?
     return false;
   }
 
+  return true;
+}
+
+bool Host::Close(int32 sock_fd) {
+  // Close() is different with ShutDown() in that it closes both direction
+  // communication of this socket.
+  //
+  // More importantly, it dec-couples the fd from TCP connection, which
+  // means this TCP connection is no longer bound with any fd, and this
+  // file descriptor will be recycled by system.
+  TcpController* tcp_con = nullptr;
+  {
+    std::unique_lock<std::mutex> lock(sockets_mutex_);
+    auto it = sockets_.find(sock_fd);
+    if (it == sockets_.end()) {
+      LogERROR("Can't find socket %u in use", sock_fd);
+      return false;
+    }
+    auto socket = it->second.get();
+    tcp_con = socket->tcp_con;
+    socket->state = CLOSED;
+    socket->fd = -1;
+
+    // Remove the socket from (fd --> socket) map. This fd will be released
+    // in the following ReleaseFileDescriptor. Now only TCP connection itself
+    // is still holding the reference of Socket, with socket state CLOSED.
+    sockets_.erase(it);
+  }
+
   // Release the file descriptor.
   ReleaseFileDescriptor(sock_fd);
 
-  return true;  
+  // Tcp connection shutdown - It sends FIN to the other side.
+  auto re = tcp_con->TryShutDown();
+  if (!re) {
+    // TODO: Close fail?
+    return false;
+  }
+
+  return true;
 }
 
 uint32 Host::GetRandomPort() {
