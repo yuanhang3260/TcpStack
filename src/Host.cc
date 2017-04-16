@@ -59,8 +59,10 @@ void Host::DemultiplexPacketsToTcps(
                              pkt->tcp_header().dest_port,
                              pkt->ip_header().source_ip,
                              pkt->tcp_header().source_port};
+    std::unique_lock<std::mutex> connections_lock(connections_mutex_);
     auto it = connections_.find(tcp_key);
     if (it == connections_.end()) {
+      connections_lock.unlock();
       if (!HandleNewConnection(*pkt)) {
         LogERROR("%s: Can't find tcp connection %s, "
                  "and neither is there any listener on {%s:%u}",
@@ -169,15 +171,16 @@ void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
              tcp_key.DebugString().c_str());
     return;
   }
+  std::unique_ptr<TcpController> tcp_con = std::move(it->second);
+  connections_.erase(it);
   connections_lock.unlock();
 
-  // Wait for this connection is ready to be deleted. Don't wait inside any
-  // lock of host.
-  it->second->WaitForReadyToDestroy();
+  // Wait for this connection is ready to be deleted.
+  tcp_con->WaitForReadyToDestroy();
 
   // Reset the socket. It now can be bound to other TCP connections (e.g. call
   // Connect on the fd to create new TCP connection).
-  int32 socket_fd = it->second->socket_fd();
+  int32 socket_fd = tcp_con->socket_fd();
   if (socket_fd > 0) {
     std::unique_lock<std::mutex> lock(sockets_mutex_);
     auto it = sockets_.find(socket_fd);
@@ -186,11 +189,6 @@ void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
       it->second->state = OPEN;
     }
   }
-
-  // Delete connection object.
-  connections_lock.lock();
-  connections_.erase(it);
-  connections_lock.unlock();
 
   // Release port.
   ReleasePort(tcp_key.dest_port);
