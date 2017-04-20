@@ -33,7 +33,11 @@ TcpController::TcpController(Host* host,
     send_buffer_(options.send_buffer_size),
     send_window_(options.send_window_base, options.send_window_size),
     timer_(std::chrono::milliseconds(5 * 100),
-           std::bind(&TcpController::TimeoutReTransmitter, this)) {
+           std::bind(&TcpController::TimeoutReTransmitter, this)),
+    syn_timer_(std::chrono::seconds(10),
+           std::bind(&TcpController::CloseAndDelete, this)),
+    fin_timer_(std::chrono::seconds(30),
+           std::bind(&TcpController::CloseAndDelete, this)) {
   state_ = CLOSED;
   fin_received_.store(false);
   pipe_state_.store(OPEN);
@@ -109,6 +113,7 @@ bool TcpController::TryConnect() {
   // to ESTABLISHED.
   SendPacket(std::unique_ptr<Packet>(sync_pkt->Copy()));
   timer_.Restart();
+  syn_timer_.Restart();
 
   return true;
 }
@@ -162,6 +167,7 @@ void TcpController::SendFIN() {
   }
   SendPacket(std::unique_ptr<Packet>(fin_pkt->Copy()));
   timer_.Restart();
+  fin_timer_.Restart();
 }
 
 // This method just enqueue the new packets into this TCP connection's private
@@ -304,6 +310,7 @@ bool TcpController::HandleSYN(std::unique_ptr<Packet> pkt) {
   // Really send SYN_ACK segment.
   SendPacket(std::unique_ptr<Packet>(sync_ack_pkt->Copy()));
   timer_.Restart();
+  syn_timer_.Restart();
 
   // Server's TCP state transit to SYN_RCVD. For now, server can call socket
   // Write() to write data into socket buffer, but no data packet will be
@@ -326,7 +333,11 @@ bool TcpController::HandleACKSYN(std::unique_ptr<Packet> pkt) {
   // increment by one, and send windows size is also synced with server's
   // receive buffer size. It is now ready to send data packets.
   std::unique_lock<std::mutex> state_lock(state_mutex_);
+
   if (state_ == SYN_SENT) {
+    // Stop the syn timer.
+    syn_timer_.Stop();
+
     {
       std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
       send_window_.NewAckedPacket(pkt->tcp_header().ack_num);
@@ -463,6 +474,7 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
     // It is 3rd handshake from client, now we can mark server --> client
     // connection is ready to send data.
     state_ = ESTABLISHED;
+    syn_timer_.Stop();
     debuginfo("Server --> Client connection established ^_^");
     state_cv_.notify_one();
   } else if (state_ == FIN_WAIT_1 && send_window_empty) {
@@ -470,10 +482,12 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
     // check if send window is cleared, with last packet (FIN) been acked.
     debuginfo("Got ACK for FIN 1");
     state_ = FIN_WAIT_2;
+    fin_timer_.Stop();
   } else if (state_ == LAST_ACK && send_window_empty) {
     debuginfo("Got LAST_ACK");
     // Received last ack. This TCP connection can finally be closed.
     state_ = CLOSED;
+    fin_timer_.Stop();
     CloseAndDelete();
   }
 

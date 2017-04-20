@@ -239,8 +239,12 @@ class TcpController {
   // to host (namely layer 2).
   PacketQueue pkt_send_buffer_;
 
-  // Timer
+  // This is the TCP sliding window timer.
   Utility::Timer timer_;
+
+  // Other timers which we use in connection management.
+  Utility::Timer syn_timer_;
+  Utility::Timer fin_timer_;
 
   // TCP state.
   TCP_STATE state_ = CLOSED;

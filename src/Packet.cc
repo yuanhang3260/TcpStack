@@ -77,6 +77,10 @@ Packet* Packet::Copy() const {
 std::string Packet::DebugString() const {
   std::vector<std::string> flags;
 
+  if (tcp_header_.rst) {
+    flags.push_back("Rst");
+  }
+
   if (tcp_header_.sync) {
     flags.push_back("Syn*");
   }

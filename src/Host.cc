@@ -70,6 +70,8 @@ void Host::DemultiplexPacketsToTcps(
                  pkt->ip_header().source_ip.c_str(),
                  pkt->tcp_header().source_port);
         // Send RST to the other side.
+        // But first check this packet is not an RST! Otherwise both sides will
+        // infinitely repeat sending RST to each other.
         if (!pkt->tcp_header().rst) {
           SendBackRST(tcp_key);
         }
