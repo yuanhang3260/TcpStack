@@ -32,8 +32,8 @@ bool SendWindow::SendPacket(std::shared_ptr<Packet> new_pkt) {
   }
 
   if (!pkts_to_ack_.empty()) {
-    uint32 last_seq_num = pkts_to_ack_.back()->tcp_header().seq_num;
-    uint32 last_pkt_length = pkts_to_ack_.back()->payload_size();
+    uint32 last_seq_num = pkts_to_ack_.back().pkt->tcp_header().seq_num;
+    uint32 last_pkt_length = pkts_to_ack_.back().pkt->payload_size();
     SANITY_CHECK(last_seq_num + last_pkt_length == send_base_ + size_,
                  "last un-acked pkt mismatch with (send_base + size)");
     if (new_pkt->tcp_header().seq_num != last_seq_num + last_pkt_length) {
@@ -47,8 +47,10 @@ bool SendWindow::SendPacket(std::shared_ptr<Packet> new_pkt) {
     }
   }
 
-  pkts_to_ack_.push(new_pkt);
+  pkts_to_ack_.emplace(new_pkt);
   size_ += new_pkt->payload_size();
+  // Start the RTT stopwatch of this packet.
+  pkts_to_ack_.back().rtt_watch_.Start();
   return true;
 }
 
@@ -70,20 +72,23 @@ bool SendWindow::NewAckedPacket(uint32 ack_num) {
   // }
 
   // Be careful of ack num overflow.
+  std::chrono::nanoseconds rtt;
   bool ack_overflow = ack_num < send_base_ && ack_num <= send_base_ + capacity_;
   if (send_base_ < ack_num || ack_overflow) {
     uint32 queue_size = pkts_to_ack_.size();
     uint32 crt_seq_num = 0, crt_pkt_length = 0;
     for (uint32 i = 0; i < queue_size; i++) {
-      crt_seq_num = pkts_to_ack_.front()->tcp_header().seq_num;
-      crt_pkt_length = pkts_to_ack_.front()->payload_size();
+      crt_seq_num = pkts_to_ack_.front().pkt->tcp_header().seq_num;
+      crt_pkt_length = pkts_to_ack_.front().pkt->payload_size();
       if (crt_seq_num < ack_num ||
           (ack_overflow && crt_seq_num >= send_base_)) {
         SANITY_CHECK(crt_seq_num + crt_pkt_length <= ack_num ||
                      (ack_overflow && crt_seq_num + crt_pkt_length > ack_num),
                      "ack number %u overlaped with packet %u, size %u",
                      ack_num, crt_seq_num, crt_pkt_length);
-        size_ -= pkts_to_ack_.front()->payload_size();
+        size_ -= pkts_to_ack_.front().pkt->payload_size();
+        pkts_to_ack_.front().rtt_watch_.Pause();
+        rtt = pkts_to_ack_.front().rtt_watch_.elapsed_time();
         pkts_to_ack_.pop();
       } else {
         break;
@@ -119,7 +124,7 @@ bool SendWindow::NewAckedPacket(uint32 ack_num) {
 std::unique_ptr<Packet> SendWindow::BasePakcketWaitingForAck() const {
   std::unique_ptr<Packet> pkt;
   if (!pkts_to_ack_.empty()) {
-    pkt.reset(pkts_to_ack_.front()->Copy());
+    pkt.reset(pkts_to_ack_.front().pkt->Copy());
   }
   return pkt;
 }

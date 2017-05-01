@@ -8,11 +8,19 @@
 #include "Base/BaseTypes.h"
 #include "Packet.h"
 #include "TcpWindow.h"
+#include "Utility/StopWatch.h"
 
 namespace net_stack {
 
 class SendWindow : public TcpWindow {
  public:
+  struct SendWindowNode {
+    SendWindowNode(std::shared_ptr<Packet> packet) : pkt(packet) {}
+
+    std::shared_ptr<Packet> pkt;
+    Utility::StopWatch rtt_watch_;
+  };
+
   SendWindow(uint32 send_base);
   SendWindow(uint32 send_base, uint32 capacity);
 
@@ -50,7 +58,7 @@ class SendWindow : public TcpWindow {
 
   // We use shared_ptr to save pakcets waiting for ack, to indicate they're not
   // "movable", because we may need re-transmission.
-  std::queue<std::shared_ptr<Packet>> pkts_to_ack_;
+  std::queue<SendWindowNode> pkts_to_ack_;
 
   uint32 last_acked_num_ = 0;
   uint32 duplicated_acks_ = 0;
