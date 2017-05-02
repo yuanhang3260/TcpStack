@@ -1,6 +1,7 @@
 #ifndef NET_STACK_TCP_CONTROLLER_
 #define NET_STACK_TCP_CONTROLLER_
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -188,6 +189,9 @@ class TcpController {
   bool InConnectingState();
   bool InClosingState();
 
+  void UpdateRTT(std::chrono::nanoseconds new_rtt);
+  std::chrono::nanoseconds CurrentTimeOut();
+
   void debuginfo(const std::string& msg);
 
   Host* host_ = nullptr;
@@ -200,11 +204,13 @@ class TcpController {
   // Packet receive buffer. This is the low-level queue to buffer received
   // packets delivered from host (namely layer 2).
   PacketQueue pkt_recv_buffer_;
+
   // Recv window. No mutex needed. Only PacketReceiveBufferListner thread
   // use it.
   RecvWindow recv_window_;
   std::atomic_bool fin_received_;
   std::atomic_uint fin_seq_;
+
   // Socket receive buffer.
   Utility::RingBuffer recv_buffer_;
   std::mutex recv_buffer_mutex_;
@@ -231,10 +237,12 @@ class TcpController {
   std::condition_variable send_buffer_data_cv_;  // send buffer has data
   std::condition_variable send_buffer_write_cv_; // send buffer has space
   std::condition_variable send_buffer_empty_cv_; // send buffer is empty
+
   // Send window.
   SendWindow send_window_;
   std::mutex send_window_mutex_;
   std::condition_variable send_window_cv_;
+
   // Packet send buffer. This is the low-level queue to buffer packets to send
   // to host (namely layer 2).
   PacketQueue pkt_send_buffer_;
@@ -250,6 +258,12 @@ class TcpController {
   TCP_STATE state_ = CLOSED;
   std::mutex state_mutex_;
   std::condition_variable state_cv_;
+
+  // RTT calculation.
+  std::chrono::nanoseconds estimated_rtt_;
+  std::chrono::nanoseconds dev_rtt_;  // deviation
+  std::chrono::nanoseconds timeout_interval_;
+  std::mutex rtt_mutex_;
 
   std::atomic_bool shutdown_;
 

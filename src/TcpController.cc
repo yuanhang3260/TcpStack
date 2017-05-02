@@ -1,4 +1,6 @@
 #include <chrono>
+#include <climits>
+#include <cstdlib>
 
 #include "Base/Log.h"
 #include "Base/MacroUtils.h"
@@ -18,6 +20,11 @@ uint32 kDefaultDataPacketSize = 10;
 uint32 kDefaultWindowBase = 0;
 uint32 kDefaultWindowSize = 100;
 uint32 kDefaultSocketBufferSize = 100;
+
+std::chrono::nanoseconds kInitialTimeout =
+    std::chrono::nanoseconds(500 * 1000 * 1000);
+double kRTTExpFactor = 0.125;
+double kRTTDevExpFactor = 0.25;
 }
 
 TcpController::TcpController(Host* host,
@@ -41,6 +48,10 @@ TcpController::TcpController(Host* host,
   state_ = CLOSED;
   fin_received_.store(false);
   pipe_state_.store(OPEN);
+
+  // Init timeout as 1s.
+  estimated_rtt_ = timeout_interval_ = kInitialTimeout;
+  dev_rtt_ = std::chrono::nanoseconds(0);
 
   timer_.SetRepeat(true);
 
@@ -112,7 +123,7 @@ bool TcpController::TryConnect() {
   // really sent to network until ACK_SYN is received and TCP state transitted
   // to ESTABLISHED.
   SendPacket(std::unique_ptr<Packet>(sync_pkt->Copy()));
-  timer_.Restart();
+  timer_.Restart(CurrentTimeOut());
   syn_timer_.Restart();
 
   return true;
@@ -166,7 +177,7 @@ void TcpController::SendFIN() {
     }
   }
   SendPacket(std::unique_ptr<Packet>(fin_pkt->Copy()));
-  timer_.Restart();
+  timer_.Restart(CurrentTimeOut());
   fin_timer_.Restart();
 }
 
@@ -278,7 +289,7 @@ bool TcpController::HandleSYN(std::unique_ptr<Packet> pkt) {
   {
     std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
     if (send_window_.size() > 0) {
-      SendPacket(send_window_.BasePakcketWaitingForAck());
+      SendPacket(send_window_.GetBasePakcketToReSend());
       return true;
     }
   }
@@ -309,7 +320,7 @@ bool TcpController::HandleSYN(std::unique_ptr<Packet> pkt) {
 
   // Really send SYN_ACK segment.
   SendPacket(std::unique_ptr<Packet>(sync_ack_pkt->Copy()));
-  timer_.Restart();
+  timer_.Restart(CurrentTimeOut());
   syn_timer_.Restart();
 
   // Server's TCP state transit to SYN_RCVD. For now, server can call socket
@@ -440,20 +451,43 @@ void TcpController::CloseAndDelete() {
   final_clean.detach();
 }
 
+void TcpController::UpdateRTT(std::chrono::nanoseconds new_rtt) {
+  std::unique_lock<std::mutex> rtt_lock(rtt_mutex_);
+
+  estimated_rtt_ = std::chrono::nanoseconds(static_cast<int64>(
+      estimated_rtt_.count() * (1 - kRTTExpFactor)
+          + new_rtt.count() * kRTTExpFactor));
+  dev_rtt_ = std::chrono::nanoseconds(static_cast<int64>(
+    dev_rtt_.count() * (1 - kRTTDevExpFactor)
+      + std::abs(new_rtt.count() - estimated_rtt_.count()) * kRTTDevExpFactor));
+  timeout_interval_ = estimated_rtt_ + 4 * dev_rtt_;
+  std::cout << "Update timeout_interval_ = "
+            << timeout_interval_.count() / 1000000 << "ms\n";
+}
+
+std::chrono::nanoseconds TcpController::CurrentTimeOut() {
+  std::unique_lock<std::mutex> rtt_lock(rtt_mutex_);
+  return timeout_interval_;
+}
+
 bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
   // ACK segment. Needs to handle TCP state transition.
   std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
 
   // Handle ack packet. If detect duplicated ACKs, do a fast re-transmit.
-  bool re_transmit = send_window_.NewAckedPacket(pkt->tcp_header().ack_num);
-  if (re_transmit) {
-    SendPacket(send_window_.BasePakcketWaitingForAck());
+  auto ack_re = send_window_.NewAckedPacket(pkt->tcp_header().ack_num);
+  if (ack_re.re_transmit) {
+    SendPacket(send_window_.GetBasePakcketToReSend());
   }
+  if (ack_re.ack_refreshed && ack_re.rtt.count() > 0) {
+    UpdateRTT(ack_re.rtt);
+  }
+
   // If send window is cleared, stop the timer.
   if (send_window_.NumPacketsToAck() == 0) {
     timer_.Stop();
   } else {
-    timer_.Restart();
+    timer_.Restart(CurrentTimeOut());
   }
 
   // Flow control - set send window size as receiver indicated.
@@ -714,7 +748,7 @@ void TcpController::SocketSendBufferListener() {
       // Really send the packet.
       SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
       if (restart_timer) {
-        timer_.Restart();
+        timer_.Restart(CurrentTimeOut());
       }
     }
 
@@ -727,7 +761,7 @@ void TcpController::SocketSendBufferListener() {
       }
       SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
       if (restart_timer) {
-        timer_.Restart();
+        timer_.Restart(CurrentTimeOut());
       }
     }
     // Notify new data can be written to send buffer from user space.
@@ -760,7 +794,7 @@ void TcpController::TimeoutReTransmitter() {
   // timer will be automatically restarted.
   std::unique_lock<std::mutex> lock(send_window_mutex_);
   if (send_window_.NumPacketsToAck() > 0) {
-    SendPacket(send_window_.BasePakcketWaitingForAck());
+    SendPacket(send_window_.GetBasePakcketToReSend());
   }
 
   // TODO: Double the timeout of timer, for congestion control.

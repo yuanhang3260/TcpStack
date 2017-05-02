@@ -5,7 +5,7 @@
 namespace net_stack {
 
 namespace {
-uint32 kMaxDuplicatedAcksOrigin = 2;
+uint32 kMaxDuplicatedAcksOrigin = 3;
 uint32 max_duplicated_acks = kMaxDuplicatedAcksOrigin;
 }
 
@@ -54,7 +54,7 @@ bool SendWindow::SendPacket(std::shared_ptr<Packet> new_pkt) {
   return true;
 }
 
-bool SendWindow::NewAckedPacket(uint32 ack_num) {
+SendWindow::AckResult SendWindow::NewAckedPacket(uint32 ack_num) {
   // Do a sanity check : Is the ack_num within send window?
   // if (capacity_ > 0 &&
   //     send_base_ < send_base_ + capacity_ &&
@@ -105,7 +105,13 @@ bool SendWindow::NewAckedPacket(uint32 ack_num) {
     last_acked_num_ = ack_num;
     duplicated_acks_ = 0;
     max_duplicated_acks = kMaxDuplicatedAcksOrigin;
-    return false;
+    bool valid_rtt = !has_retransmitted_pkt_;
+    if (pkts_to_ack_.empty()) {
+      has_retransmitted_pkt_ = false;
+    }
+    // If sendwindow has re-transmitted pkt, the rtt is not a valid value to
+    // refresh timeout interval.
+    return AckResult(true, false, valid_rtt? rtt : std::chrono::nanoseconds(0));
   } else if (ack_num == send_base_) {
     duplicated_acks_++;
     if (duplicated_acks_ >= max_duplicated_acks) {
@@ -113,17 +119,18 @@ bool SendWindow::NewAckedPacket(uint32 ack_num) {
       // Increase duplicated acks torlerance by factor of 1.5 to avoid too many
       // *duplicated* re-transmission.
       max_duplicated_acks *= 1.5;
-      return true;
+      return AckResult(false, true, std::chrono::nanoseconds(0));
     }
-    return false;
+    return AckResult(false, false, std::chrono::nanoseconds(0));
   } else {
-    return false;
+    return AckResult(false, false, std::chrono::nanoseconds(0));
   }
 }
 
-std::unique_ptr<Packet> SendWindow::BasePakcketWaitingForAck() const {
+std::unique_ptr<Packet> SendWindow::GetBasePakcketToReSend() {
   std::unique_ptr<Packet> pkt;
   if (!pkts_to_ack_.empty()) {
+    has_retransmitted_pkt_ = true;
     pkt.reset(pkts_to_ack_.front().pkt->Copy());
   }
   return pkt;

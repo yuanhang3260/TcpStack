@@ -19,6 +19,7 @@ class SendWindow : public TcpWindow {
 
     std::shared_ptr<Packet> pkt;
     Utility::StopWatch rtt_watch_;
+    uint32 re_transmit_count_ = 0;
   };
 
   SendWindow(uint32 send_base);
@@ -30,7 +31,21 @@ class SendWindow : public TcpWindow {
   // Get a newly acked packet. Check if we can move forward send base.
   // Return value true indicates overly duplicated ACKs, and we need do a fast
   // re-transmit.
-  bool NewAckedPacket(uint32 ack_num);
+  struct AckResult {
+    AckResult(bool ack_refreshed_, bool re_transmit_,
+              std::chrono::nanoseconds rtt_) :
+        ack_refreshed(ack_refreshed_),
+        re_transmit(re_transmit_),
+        rtt(rtt_) {
+    }
+
+    // Send base is updated.
+    bool ack_refreshed = false;
+    bool re_transmit = false;
+    std::chrono::nanoseconds rtt;  // nanoseconds
+  };
+
+  AckResult NewAckedPacket(uint32 ack_num);
 
   DEFINE_ACCESSOR(capacity, uint32);
   DEFINE_ACCESSOR(send_base, uint32);
@@ -42,7 +57,7 @@ class SendWindow : public TcpWindow {
 
   uint32 NextSeqNumberToSend() const;
 
-  std::unique_ptr<Packet> BasePakcketWaitingForAck() const;
+  std::unique_ptr<Packet> GetBasePakcketToReSend();
 
   void Reset();
 
@@ -62,6 +77,8 @@ class SendWindow : public TcpWindow {
 
   uint32 last_acked_num_ = 0;
   uint32 duplicated_acks_ = 0;
+
+  bool has_retransmitted_pkt_ = false;
 };
 
 }  // namespace net_stack

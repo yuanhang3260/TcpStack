@@ -14,7 +14,7 @@ namespace {
 const double kPacketLossRatio = 0.5;
 const double kPacketCorruptRatio = 0;
 
-const uint32 kChannelDelayMicroSeconds = 1 * 20 * 1000;
+const uint32 kChannelDelayMicroSeconds = 1 * 20 * 1000;  // 20 ms
 
 }  // namespace
 
