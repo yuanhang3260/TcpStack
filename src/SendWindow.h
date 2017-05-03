@@ -32,15 +32,17 @@ class SendWindow : public TcpWindow {
   // Return value true indicates overly duplicated ACKs, and we need do a fast
   // re-transmit.
   struct AckResult {
-    AckResult(bool ack_refreshed_, bool re_transmit_,
+    AckResult(bool ack_refreshed_, bool dup_ack_, bool re_transmit_,
               std::chrono::nanoseconds rtt_) :
         ack_refreshed(ack_refreshed_),
+        dup_ack(dup_ack_),
         re_transmit(re_transmit_),
         rtt(rtt_) {
     }
 
     // Send base is updated.
     bool ack_refreshed = false;
+    bool dup_ack = false;
     bool re_transmit = false;
     std::chrono::nanoseconds rtt;  // nanoseconds
   };

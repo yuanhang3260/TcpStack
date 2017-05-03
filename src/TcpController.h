@@ -192,6 +192,9 @@ class TcpController {
   void UpdateRTT(std::chrono::nanoseconds new_rtt);
   std::chrono::nanoseconds CurrentTimeOut();
 
+  void UpdateCongestionControl(const SendWindow::AckResult& ack_re);
+  uint32 CurrentCWND();
+
   void debuginfo(const std::string& msg);
 
   Host* host_ = nullptr;
@@ -264,6 +267,17 @@ class TcpController {
   std::chrono::nanoseconds dev_rtt_;  // deviation
   std::chrono::nanoseconds timeout_interval_;
   std::mutex rtt_mutex_;
+
+  // Congestion control.
+  enum CongestionControlState {
+    SLOW_START,
+    CONGESTION_AVOIDANCE,
+    FAST_RECOVERY,
+  };
+  CongestionControlState cc_state_ = SLOW_START;
+  uint32 cwnd_;
+  uint32 ssthresh_;
+  std::mutex cc_mutex_;
 
   std::atomic_bool shutdown_;
 

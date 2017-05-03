@@ -111,7 +111,8 @@ SendWindow::AckResult SendWindow::NewAckedPacket(uint32 ack_num) {
     }
     // If sendwindow has re-transmitted pkt, the rtt is not a valid value to
     // refresh timeout interval.
-    return AckResult(true, false, valid_rtt? rtt : std::chrono::nanoseconds(0));
+    return AckResult(true, false, false,
+                     valid_rtt? rtt : std::chrono::nanoseconds(0));
   } else if (ack_num == send_base_) {
     duplicated_acks_++;
     if (duplicated_acks_ >= max_duplicated_acks) {
@@ -119,11 +120,11 @@ SendWindow::AckResult SendWindow::NewAckedPacket(uint32 ack_num) {
       // Increase duplicated acks torlerance by factor of 1.5 to avoid too many
       // *duplicated* re-transmission.
       max_duplicated_acks *= 1.5;
-      return AckResult(false, true, std::chrono::nanoseconds(0));
+      return AckResult(false, true, true, std::chrono::nanoseconds(0));
     }
-    return AckResult(false, false, std::chrono::nanoseconds(0));
+    return AckResult(false, true, false, std::chrono::nanoseconds(0));
   } else {
-    return AckResult(false, false, std::chrono::nanoseconds(0));
+    return AckResult(false, false, false, std::chrono::nanoseconds(0));
   }
 }
 

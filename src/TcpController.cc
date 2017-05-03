@@ -14,6 +14,7 @@ namespace {
 uint32 kThreadPoolSize = 6;
 
 uint32 kDefaultDataPacketSize = 10;
+uint32 kInitialSSThresh = 8 * kDefaultDataPacketSize;
 
 //uint32 kMaxWindowSize = 65536;
 
@@ -52,6 +53,9 @@ TcpController::TcpController(Host* host,
   // Init timeout as 1s.
   estimated_rtt_ = timeout_interval_ = kInitialTimeout;
   dev_rtt_ = std::chrono::nanoseconds(0);
+
+  cwnd_ = kDefaultDataPacketSize;
+  ssthresh_ = kInitialSSThresh;
 
   timer_.SetRepeat(true);
 
@@ -470,6 +474,48 @@ std::chrono::nanoseconds TcpController::CurrentTimeOut() {
   return timeout_interval_;
 }
 
+void TcpController::UpdateCongestionControl(
+    const SendWindow::AckResult& ack_re) {
+  std::unique_lock<std::mutex> cc_lock(cc_mutex_);
+  switch(cc_state_) {
+    case SLOW_START: {
+      if (ack_re.ack_refreshed) {
+        cwnd_ += kDefaultDataPacketSize;
+        if (cwnd_ >= ssthresh_) {
+          cc_state_ = CONGESTION_AVOIDANCE;
+        }
+      } else if (ack_re.re_transmit) {
+        ssthresh_ = cwnd_ / 2;
+        cwnd_ = ssthresh_ + 2 * kDefaultDataPacketSize;
+        cc_state_ = FAST_RECOVERY;
+      }
+      break;
+    }
+    case CONGESTION_AVOIDANCE: {
+      if (ack_re.ack_refreshed) {
+        cwnd_ += kDefaultDataPacketSize * kDefaultDataPacketSize / cwnd_;
+      } else if (ack_re.re_transmit) {
+        ssthresh_ = cwnd_ / 2;
+        cwnd_ = ssthresh_ + 2 * kDefaultDataPacketSize;
+        cc_state_ = FAST_RECOVERY;
+      }
+    }
+    case FAST_RECOVERY: {
+      if (ack_re.ack_refreshed) {
+        cwnd_ = ssthresh_;
+        cc_state_ = CONGESTION_AVOIDANCE;
+      } else if (ack_re.dup_ack) {
+        cwnd_ += kDefaultDataPacketSize;
+      }
+    }
+  }
+}
+
+uint32 TcpController::CurrentCWND() {
+  std::unique_lock<std::mutex> lock(send_window_mutex_);
+  return cwnd_;
+}
+
 bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
   // ACK segment. Needs to handle TCP state transition.
   std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
@@ -479,6 +525,8 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
   if (ack_re.re_transmit) {
     SendPacket(send_window_.GetBasePakcketToReSend());
   }
+
+  // Update RTT.
   if (ack_re.ack_refreshed && ack_re.rtt.count() > 0) {
     UpdateRTT(ack_re.rtt);
   }
@@ -489,6 +537,9 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
   } else {
     timer_.Restart(CurrentTimeOut());
   }
+
+  // Update congestion control state.
+  UpdateCongestionControl(ack_re);
 
   // Flow control - set send window size as receiver indicated.
   debuginfo("set window_size = " +
@@ -797,7 +848,12 @@ void TcpController::TimeoutReTransmitter() {
     SendPacket(send_window_.GetBasePakcketToReSend());
   }
 
-  // TODO: Double the timeout of timer, for congestion control.
+  std::unique_lock<std::mutex> cc_lock(cc_mutex_);
+  ssthresh_ = cwnd_ / 2;
+  cwnd_ = kDefaultDataPacketSize;
+  cc_state_ = SLOW_START;
+
+  // TODO: Double the timeout of timer, for congestion control?
 }
 
 std::shared_ptr<Packet> TcpController::MakeDataPacket(
