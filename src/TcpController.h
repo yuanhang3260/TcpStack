@@ -16,7 +16,7 @@
 #include "RecvWindow.h"
 #include "SendWindow.h"
 #include "Strings/Utils.h"
-#include "Utility/RingBuffer.h"
+#include "Utility/InfiniteBuffer.h"
 #include "Utility/RingBuffer.h"
 #include "Utility/ThreadPool.h"
 #include "Utility/Timer.h"
@@ -194,6 +194,8 @@ class TcpController {
 
   void UpdateCongestionControl(const SendWindow::AckResult& ack_re);
   uint32 CurrentCWND();
+
+  uint32 GetNewSendWindowSize(uint32 rwnd);
 
   void debuginfo(const std::string& msg);
 

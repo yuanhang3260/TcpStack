@@ -11,6 +11,7 @@
 namespace net_stack {
 
 namespace {
+
 uint32 kThreadPoolSize = 6;
 
 uint32 kDefaultDataPacketSize = 10;
@@ -26,6 +27,9 @@ std::chrono::nanoseconds kInitialTimeout =
     std::chrono::nanoseconds(500 * 1000 * 1000);
 double kRTTExpFactor = 0.125;
 double kRTTDevExpFactor = 0.25;
+
+bool kEnableCongestionControl = false;
+
 }
 
 TcpController::TcpController(Host* host,
@@ -359,9 +363,11 @@ bool TcpController::HandleACKSYN(std::unique_ptr<Packet> pkt) {
       if (send_window_.NumPacketsToAck() == 0) {
         timer_.Stop();
       }
+      uint32 new_send_window_capacity =
+          GetNewSendWindowSize(pkt->tcp_header().window_size);
       debuginfo("set window_size = " +
-                std::to_string(pkt->tcp_header().window_size));
-      send_window_.set_capacity(pkt->tcp_header().window_size);
+                std::to_string(new_send_window_capacity));
+      send_window_.set_capacity(new_send_window_capacity);
     }
 
     // Mark client --> server connection is ready.
@@ -512,8 +518,16 @@ void TcpController::UpdateCongestionControl(
 }
 
 uint32 TcpController::CurrentCWND() {
-  std::unique_lock<std::mutex> lock(send_window_mutex_);
+  std::unique_lock<std::mutex> cc_lock(cc_mutex_);
   return cwnd_;
+}
+
+uint32 TcpController::GetNewSendWindowSize(uint32 rwnd) {
+  uint32 new_size = rwnd;
+  if (kEnableCongestionControl) {
+    new_size = std::min(new_size, CurrentCWND());
+  }
+  return new_size;
 }
 
 bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
@@ -542,9 +556,11 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
   UpdateCongestionControl(ack_re);
 
   // Flow control - set send window size as receiver indicated.
+  uint32 new_send_window_capacity =
+      GetNewSendWindowSize(pkt->tcp_header().window_size);
   debuginfo("set window_size = " +
-            std::to_string(pkt->tcp_header().window_size));
-  send_window_.set_capacity(pkt->tcp_header().window_size);
+            std::to_string(new_send_window_capacity));
+  send_window_.set_capacity(new_send_window_capacity);
 
   // If send window has free space, notify packet send thread.
   if (send_window_.free_space() > 0 || send_window_.capacity() == 0) {
