@@ -13,21 +13,39 @@
 
 #include "Base/MacroUtils.h"
 #include "BaseChannel.h"
+#include "NumPool.h"
 #include "PacketQueue.h"
 #include "TcpController.h"
 #include "Utility/ThreadPool.h"
 
 namespace net_stack {
 
-struct Socket {
-  Socket(int32 file_descriptor) : fd(file_descriptor),
-                                  state(OPEN),
-                                  tcp_con(nullptr) {}
+class Host;
 
-  int32 fd;
-  SocketState state;
-  TcpController* tcp_con;
-  std::mutex mutex_;
+class Process {
+ public:
+  Process(Host* host);
+  ~Process();
+
+  // "System Calls".
+  int32 Socket();
+  bool Bind(int32 socket_fd,
+            const std::string& local_ip, uint32 local_port);
+  bool Listen(int32 socket_fd);
+  int Accept(int32 listen_socket);
+  bool Connect(int32 socket_fd,
+               const std::string& remote_ip, uint32 remote_port);
+
+ private:
+  // Kernel ref.
+  Host* host_;
+
+  // All available file descriptors.
+  std::unique_ptr<NumPool> fd_pool_;
+
+  // Process file descriptor table.
+  std::map<int32, id> fd_table_;
+  std::mutex fd_table_mutex_;
 };
 
 class Host {
@@ -52,23 +70,30 @@ class Host {
   int32 ReadData(int32 socket_fd, byte* buffer, int32 size);
   int32 WriteData(int32 socket_fd, const byte* buffer, int32 size);
 
-  // "System Calls".
-  int32 Socket();
+  // System calls implementations.
+  std::pair<int32, Socket*> CreateNewSocket();
 
-  bool Bind(int32 sock_fd, const std::string& local_ip, uint32 local_port);
-  bool Connect(int32 sock_fd,
-               const std::string& remote_ip, uint32 remote_port);
-  bool Listen(int32 sock_fd);
-  int Accept(int32 sock_fd);
+  bool SocketBind(int32 open_file_id,
+                  const std::string& local_ip, uint32 local_port);
+
+  bool SocketListen(int32 open_file_id);
+
+  int SocketAccept(int32 open_file_id);
+
+  bool SocketConnect(int32 open_file_id,
+                     const std::string& remote_ip, uint32 remote_port);
 
   bool ShutDown(int32 sock_fd);
   bool Close(int32 sock_fd);
 
   std::string hostname() const { return hostname_; }
-  std::string ip_address() const { return ip_address_; }
+  std::string ip_address() const { return local_ip_address_; }
 
  private:
   void Initialize();
+
+  Socket* GetSocket(int32 open_file_id);
+  bool GetSocketLocalBound(int32 open_file_id, LocalLayerThreeKey* key);
 
   void PacketsReceiveListener();
   void DemultiplexPacketsToTcps(
@@ -80,10 +105,6 @@ class Host {
 
   void SendBackRST(TcpControllerKey tcp_key);
 
-  // Get next available file descriptor.
-  int32 GetFileDescriptor();
-  void ReleaseFileDescriptor(int32 fd);
-
   // Port resource management.
   uint32 GetRandomPort();
   void ReleasePort(uint32 port);
@@ -91,36 +112,35 @@ class Host {
   void debuginfo(const std::string& msg);
 
   std::string hostname_;
-  std::string ip_address_;  // Human readable IP address (aa.bb.cc.dd)
+  std::string local_ip_address_;  // Human readable IP address (aa.bb.cc.dd)
   BaseChannel* channel_;  // This is the channel to send packets.
 
   // Receive packets queue.
   PacketQueue recv_pkt_queue_;
-
   // Send packets queue.
   PacketQueue send_pkt_queue_;
 
+  // Global open file table.
+  std::unique_ptr<NumPool> open_file_id_pool_;
+  std::map<int32, std::unique_ptr<KernelOpenFile>> open_files_table_;
+  std::mutex open_files_table_mutex_;
+
   // All TCP connections maintained by this host.
-  using TcpConnectionMap = 
+  using TcpConnectionMap =
       std::unordered_map<TcpControllerKey, std::unique_ptr<TcpController>>;
   TcpConnectionMap connections_;
   std::mutex connections_mutex_;
-
-  // All available file descriptors.
-  std::set<int32> fd_pool_;
-  std::mutex fd_pool_mutex_;
 
   // All sockets currently mapped to file descriptor.
   std::unordered_map<int32, std::shared_ptr<net_stack::Socket>> sockets_;
   std::mutex sockets_mutex_;
 
   // All available ports.
-  std::set<uint32> port_pool_;
-  std::mutex port_pool_mutex_;
+  std::unique_ptr<NumPool> port_pool_;
 
-  // File descriptors that have been bound.
-  std::unordered_map<int32, LocalLayerThreeKey> bound_fds_;
-  std::mutex bound_fds_mutex_;
+  // Sockets that have been bound to port.
+  std::unordered_map<int32, LocalLayerThreeKey> bound_sockets_;
+  std::mutex bound_sockets_mutex_;
 
   // Local listeners.
   struct Listener {

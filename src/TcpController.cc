@@ -54,7 +54,7 @@ TcpController::TcpController(Host* host,
   fin_received_.store(false);
   pipe_state_.store(OPEN);
 
-  // Init timeout as 1s.
+  // Init timeout is 500ms.
   estimated_rtt_ = timeout_interval_ = kInitialTimeout;
   dev_rtt_ = std::chrono::nanoseconds(0);
 
@@ -111,6 +111,7 @@ bool TcpController::TryConnect() {
 
   auto sync_pkt = MakeSyncPacket(send_window_.send_base());
 
+  // This just registers the new packet in send window. Not really sending it.
   {
     std::unique_lock<std::mutex> send_window_lock(send_window_mutex_);
     if (!send_window_.SendPacket(sync_pkt)) {
@@ -125,9 +126,9 @@ bool TcpController::TryConnect() {
     state_ = SYN_SENT;
   }
 
-  // Send the sync packet (1st handshake), and wait in state SYN_SENT for
-  // ACK_SYN from server. Before that happens, user can call socket Write() to
-  // write data into socket buffer and return success, but no data will be
+  // Actually send the sync packet (1st handshake), and wait in state SYN_SENT
+  // for ACK_SYN from server. Before that happens, user can call socket Write()
+  // to write data into socket buffer and return success, but no data will be
   // really sent to network until ACK_SYN is received and TCP state transitted
   // to ESTABLISHED.
   SendPacket(std::unique_ptr<Packet>(sync_pkt->Copy()));

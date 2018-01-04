@@ -29,9 +29,9 @@ class Socket;
 // TCP uses <source_ip, source_port, dest_ip, dest_port> as unique indentifier.
 struct TcpControllerKey {
   std::string source_ip;
-  uint32 source_port;
+  uint32 source_port = 0;
   std::string dest_ip;
-  uint32 dest_port;
+  uint32 dest_port = 0;
 
   bool operator==(const TcpControllerKey &other) const { 
     return (source_ip == other.source_ip && source_port == other.source_port &&
@@ -64,7 +64,7 @@ struct TcpControllerKey {
 // Local listener key. It only bundles {local ip, local_port} as key.
 struct LocalLayerThreeKey {
   std::string local_ip;
-  uint32 local_port;
+  uint32 local_port = 0;
 
   bool operator==(const LocalLayerThreeKey &other) const { 
     return local_ip == other.local_ip && local_port == other.local_port;

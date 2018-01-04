@@ -16,8 +16,10 @@ HYLIB_DIR=../HyLib/
 HYLIB=../HyLib/libhy.a
 
 OBJ = $(OBJ_DIR)/BaseChannel.o \
+			$(OBJ_DIR)/Common.o \
 			$(OBJ_DIR)/Host.o \
       $(OBJ_DIR)/IPHeader.o \
+      $(OBJ_DIR)/NumPool.o \
       $(OBJ_DIR)/Packet.o \
       $(OBJ_DIR)/PacketQueue.o \
       $(OBJ_DIR)/RecvWindow.o \

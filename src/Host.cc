@@ -6,12 +6,118 @@
 
 namespace net_stack {
 
+namespace {
+// Process file descriptor available in [3, 64).
+const int32 kMinFd = 3;
+const int32 kMaxFd = 63;
+// Open file id available in [0, 256).
+const int32 kMinOpenFileId = 0;
+const int32 kMaxOpenFileId = 255;
+// Port available in [1024, 1024 + 128).
+const int32 kMinPort = 1024;
+const int32 kMaxPort = 1151;
+}
+
+// ***************************** Process ************************************ //
+Process::Process(Host* host) : host_(host) {
+  fd_pool_ = ptr::MakeUnique<NumPool>(kMinFd, kMaxFd);
+}
+
+Process::~Process() {}
+
+int32 Process::FindFdMappedFileId(int32 fd) {
+  // Find kernel open file entry this file descriptor maps to.
+  std::unique_lock<std::mutex> lock(fd_table_mutex_);
+  auto it = fd_table_.find(fd);
+  if (it == fd_table_.end()) {
+    LogERROR("Invalid fd %d, not allocated");
+    return -1;
+  }
+  int32 open_file_id = it->second;
+  return open_file_id;
+}
+
+int32 Process::Socket() {
+  // Allocate a new file descriptor.
+  int32 fd = fd_pool_.Allocate();
+  if (fd < 0) {
+    return -1;
+  }
+
+  // Create socket in kernel and return open file table entry id.
+  int open_file_id = host_->CreateNewSocket().first;
+  if (open_file_id < 0) {
+    return -1;
+  }
+
+  // Update process fd table.
+  std::unique_lock<std::mutex> lock(fd_table_mutex_);
+  fd_table_->emplace(fd, open_file_id);
+  return fd;
+}
+
+bool Process::Bind(int32 socket_fd,
+                   const std::string& local_ip, uint32 local_port) {
+  int32 open_file_id = FindFdMappedFileId(socket_fd);
+  if (open_file_id < 0) {
+    return false;
+  }
+  return host_->SocketBind(open_file_id, local_ip, local_port);
+}
+
+bool Process::Listen(int32 socket_fd) {
+  int32 open_file_id = FindFdMappedFileId(socket_fd);
+  if (open_file_id < 0) {
+    return false;
+  }
+  return host_->SocketListen(open_file_id);
+}
+
+int Process::Accept(int32 listen_socket) {
+  int32 open_file_id = FindFdMappedFileId(socket_fd);
+  if (open_file_id < 0) {
+    return false;
+  }
+
+  // Wait for accept new connection, and kernel will return a new open file
+  // id associated with a newly created socket. Process should allocate a new
+  // file descriptor and map it to the new open file.
+  int32 new_open_file_id = host_->SocketAccept(open_file_id);
+  int32 new_fd = fd_pool_.Allocate();
+  if (new_fd < 0) {
+    // TODO: What happens if allocating new fd fails? Kernel will still keep
+    // the socket object in open file table, but no process fd will map to it.
+    // The open file will be ab dangling entry in table. So we should close
+    // this socket and connection in kernel. Kernel will immediately send a RST
+    // to the TCP connection.
+
+    // SendBackRST(tcp_key);
+    return -1;
+  }
+
+  std::unique_lock<std::mutex> lock(fd_table_mutex_);
+  fd_table_->emplace(new_fd, new_open_file_id);
+  debuginfo("Accept fd = " + std::to_string(new_fd));
+  return new_fd;
+}
+
+bool Process::Connect(int32 socket_fd,
+                      const std::string& remote_ip, uint32 remote_port) {
+  int32 open_file_id = FindFdMappedFileId(socket_fd);
+  if (open_file_id < 0) {
+    return false;
+  }
+
+  return host_->SocketConnect(open_file_id, remote_ip, remote_port);
+}
+
+// ******************************* Host ************************************* //
 Host::Host(const std::string& hostname, const std::string& ip_address,
            BaseChannel* channel) :
     hostname_(hostname),
-    ip_address_(ip_address),
+    local_ip_address_(ip_address),
     channel_(channel),
-    thread_pool_(2) {
+    thread_pool_(5) {
   Initialize();
 
   thread_pool_.AddTask(std::bind(&Host::PacketsReceiveListener, this));
@@ -25,15 +131,148 @@ Host::~Host() {
 }
 
 void Host::Initialize() {
-  // Init file descriptor pool. We only reserve [3, 64) file descriptors.
-  for (uint32 i = 3; i < 64; i++) {
-    fd_pool_.insert(i);
+  open_file_id_pool_ = ptr::MakeUnique<NumPool>(kMinOpenFileId, kMaxOpenFileId);
+  port_pool_ = ptr::MakeUnique<NumPool>(kMinPort, kMaxPort);
+}
+
+Socket* Host::GetSocket(int32 open_file_id) {
+  std::unique_lock<std::mutex> lock(open_files_table_mutex_);
+  auto it = open_files_table_.find(open_file_id);
+  if (it == open_files_table_.end()) {
+    LogERROR("Could not find open file id %d", open_file_id);
+    return nullptr;
   }
 
-  // Init port pool. We only reserve [1024, 1024 + 128) ports.
-  for (uint32 i = 1024; i < 1024 + 128; i++) {
-    port_pool_.insert(i);
+  if (it->second->type != KernelOpenFile::SOCKET) {
+    LogERROR("Could not bind port %d to open file id %d which is not a socket");
+    return nullptr;
   }
+
+  return &(it->second->socket);
+}
+
+bool Host::GetSocketLocalBound(int32 open_file_id, LocalLayerThreeKey* key) {
+  Socket* socket = GetSocket(open_file_id);
+  if (socket == nullptr) {
+    return false;
+  }
+
+  if (!socket->isBound()) {
+    LogERROR("Could not listen on socket which is not a bound to any port");
+    return false;
+  }
+  *key = socket->local_bound;
+  return true
+}
+
+std::pair<int32, Socket*> Host::CreateNewSocket() {
+  int32 id = open_file_id_pool_.Allocate();
+  if (id < 0) {
+    return std::make_pair<int32, Socket*>(-1, nullptr);
+  }
+
+  std::unique_lock<std::mutex> lock(open_files_table_mutex_);
+  open_files_table_.emplace(id, ptr::MakeUnique<KernelOpenFile>(SOCKET));
+  open_files_table_.at(id)->IncRef();
+  return std::make_pair<int32, Socket*>(id, open_files_table_.at(id).get());
+}
+
+bool Host::SocketBind(int32 open_file_id,
+                      const std::string& local_ip, uint32 local_port) {
+  if (!port_pool_.Take(local_port)) {
+    LogERROR("Could not bind to local_port %d which is already being used.");
+    return false;
+  }
+
+  Socket* socket = GetSocket(open_file_id);
+  if (socket == nullptr) {
+    return false;
+  }
+
+  if (socket->isBound()) {
+    LogERROR("Could not bind open file id %d which is already bound to port %d",
+             open_file_id, socket->local_bound.local_port);
+    return false;
+  }
+
+  socket->Bind(local_ip, local_port);
+  return true;
+}
+
+bool Host::SocketListen(int32 open_file_id) {
+  LocalLayerThreeKey local_listener_key;
+  if (!GetSocketLocalBound(open_file_id, &local_listener_key)) {
+    return false;
+  }
+
+  // Insert {local_ip, local_port} to listener map.
+  std::unique_lock<std::mutex> listeners_lock(listeners_mutex_);
+  std::unique_ptr<Listener> listener(new Listener);
+  listeners_.emplace(local_listener_key, std::move(listener));
+}
+
+bool Host::SocketAccept(int32 open_file_id) {
+  // Get socket listener.
+  Listener* listener = nullptr;
+  {
+    std::unique_lock<std::mutex> listeners_lock(listeners_mutex_);
+    auto it = listeners_.find(local_listener_key);
+    if (it == listeners_.end()) {
+      LogERROR("Socket is not in listening mode");
+      return false;
+    }
+    listener = it->second.get();
+  }
+
+  // There is incoming connection to this listening socket.
+  std::unique_lock<std::mutex> listener_lock(listener->mutex);
+  listener->cv.wait(listener_lock,
+                    [&] {return !listener->tcp_sockets.empty(); });
+  int open_file_id = listener->tcp_sockets.front();
+  listener->tcp_sockets.pop();
+  return open_file_id;
+}
+
+bool Host::SocketConnect(int32 open_file_id,
+                         const std::string& remote_ip, uint32 remote_port) {
+  // Check if this socket is bound to local port. If not, assign a random port
+  // and bind to it.
+  LocalLayerThreeKey local_key;
+  Socket* socket = GetSocket(open_file_id);
+  if (!socket->isBound()) {
+    local_key = LocalLayerThreeKey{local_ip_address_,
+                                   port_pool_.AllocateRandom()};
+    socket->Bind(local_key);
+  } else {
+    local_key = socket->local_bound;
+  }
+
+  // Create TcpController and try establishing TCP connection with remote host.
+  // Note remote host is the "source" part in TcpControllerKey.
+  TcpControllerKey tcp_key{remote_ip, remote_port, 
+                           local_key.local_ip, local_key.local_port};
+  auto tcp_options = TcpController::GetDefaultOptions();
+  tcp_options.send_window_base = 0;  /* Utils::RandomNumber(); */
+  connections_.emplace(tcp_key,
+                       ptr::MakeUnique<TcpController>(
+                          this, tcp_key, socket, tcp_options));
+  auto tcp_con = connections_.at(tcp_key).get();
+  socket->tcp_con = tcp_con;
+
+  // Clean up steps.
+  auto clean_up = Utility::CleanUp([&]() {
+    port_pool_->Release(local_key.local_port);
+  });
+
+  // TcpController::TryConnect starts three-way handshake, by sending a SYNC
+  // segment to remote host.
+  bool re = tcp_con->TryConnect();
+  if (!re) {
+    return false;
+  }
+
+  clean_up.clear();
+  return true;
 }
 
 void Host::MovePacketsFromChannel(
@@ -64,11 +303,8 @@ void Host::DemultiplexPacketsToTcps(
     if (it == connections_.end()) {
       connections_lock.unlock();
       if (!HandleNewConnection(*pkt)) {
-        LogERROR("%s: Can't find tcp connection %s, "
-                 "and neither is there any listener on {%s:%u}",
-                 hostname_.c_str(), tcp_key.DebugString().c_str(),
-                 pkt->ip_header().source_ip.c_str(),
-                 pkt->tcp_header().source_port);
+        LogERROR("%s: Can't find tcp connection %s",
+                 hostname_.c_str(), tcp_key.DebugString().c_str());
         // Send RST to the other side.
         // But first check this packet is not an RST! Otherwise both sides will
         // infinitely repeat sending RST to each other.
@@ -121,17 +357,19 @@ bool Host::HandleNewConnection(const Packet& pkt) {
                            pkt.tcp_header().source_port};
 
   // Create Socket object.
-  int32 new_fd = GetFileDescriptor();
-  std::shared_ptr<net_stack::Socket> socket(new net_stack::Socket(new_fd));
-  {
-    std::unique_lock<std::mutex> sockets_lock(sockets_mutex_);
-    sockets_.emplace(new_fd, socket);
+  auto new_socket = CreateNewSocket();
+  int open_file_id = new_socket.first;
+  if (open_file_id < 0) {
+    LogERROR("Could not create socket for new TCP connectoin.");
+    return false;
   }
+  Socket* socket = new_socket.second;
 
   // Create TCP connection object.
   auto tcp_options = TcpController::GetDefaultOptions();
-  // Set recv_base = sender's seq_num. This marks I'm expecting to receive the
-  // first packet with exactly this seq_num. Client to server connection starts!
+  // Set recv_base = sender's SYNC seq_num. This marks I'm expecting to receive
+  // the first packet with exactly this seq_num. Now client to server connection
+  // is established.
   tcp_options.recv_window_base = pkt.tcp_header().seq_num;
 
   {
@@ -144,7 +382,7 @@ bool Host::HandleNewConnection(const Packet& pkt) {
 
   // Notify Accept() to get the a new TCP connection socket.
   std::unique_lock<std::mutex> listener_lock(listener->mutex);
-  listener->tcp_sockets.push(new_fd);
+  listener->tcp_sockets.push(open_file_id);
   listener->cv.notify_one();
   return true;
 }
@@ -193,7 +431,7 @@ void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
   }
 
   // Release port.
-  ReleasePort(tcp_key.dest_port);
+  port_pool_.Release(tcp_key.dest_port);
 
   debuginfo(Strings::StrCat(
       "Connection ", tcp_key.DebugString(), " safely deleted ^_^"));
@@ -254,126 +492,6 @@ int32 Host::WriteData(int32 socket_fd, const byte* buffer, int32 size) {
   }
 
   return tcp_con->WriteData(buffer, size);
-}
-
-int32 Host::Socket() {
-  int32 fd = GetFileDescriptor();
-  std::unique_lock<std::mutex> lock(sockets_mutex_);
-  sockets_.emplace(fd, ptr::MakeUnique<net_stack::Socket>(fd));
-  return fd;
-}
-
-bool Host::Bind(int32 sock_fd,
-                const std::string& local_ip, uint32 local_port) {
-  std::unique_lock<std::mutex> lock(bound_fds_mutex_);
-  auto it = bound_fds_.find(sock_fd);
-  if (it != bound_fds_.end()) {
-    LogERROR("fd %u already bound to {%s, %u}",
-             sock_fd, it->second.local_ip.c_str(), it->second.local_port);
-    return false;
-  }
-
-  bound_fds_.emplace(sock_fd, LocalLayerThreeKey{local_ip, local_port});
-  return true;
-}
-
-bool Host::Listen(int32 sock_fd) {
-  std::unique_lock<std::mutex> bound_fds_lock(bound_fds_mutex_);
-  auto it = bound_fds_.find(sock_fd);
-  if (it == bound_fds_.end()) {
-    LogERROR("fd %u is not bound to any local {ip_address, port}");
-    return false;
-  }
-
-  // insert {local_ip, local_port} to listener set.
-  std::unique_lock<std::mutex> listeners_lock(listeners_mutex_);
-  std::unique_ptr<Listener> listener(new Listener);
-  listeners_.emplace(it->second, std::move(listener));
-  return true;
-}
-
-int Host::Accept(int32 listen_sock) {
-  std::unique_lock<std::mutex> bound_fds_lock(bound_fds_mutex_);
-  auto it = bound_fds_.find(listen_sock);
-  if (it == bound_fds_.end()) {
-    LogERROR("fd %u is not bound to any local {ip_address, port}");
-    return false;
-  }
-  LocalLayerThreeKey key = it->second;
-  bound_fds_lock.unlock();
-
-  std::unique_lock<std::mutex> listeners_lock(listeners_mutex_);
-  auto it2 = listeners_.find(key);
-  if (it2 == listeners_.end()) {
-    LogERROR("Socket %d is not in listening mode", listen_sock);
-    return -1;
-  }
-  listeners_lock.unlock();
-
-  Listener* listener = it2->second.get();
-  std::unique_lock<std::mutex> listener_lock(listener->mutex);
-  listener->cv.wait(listener_lock,
-                    [&] {return !listener->tcp_sockets.empty(); });
-  int new_fd = listener->tcp_sockets.front();
-  debuginfo("Accept fd = " + std::to_string(new_fd));
-  listener->tcp_sockets.pop();
-  return new_fd;
-}
-
-bool Host::Connect(int32 sock_fd,
-                   const std::string& remote_ip, uint32 remote_port) {
-  // Check if this socket is bound to local port. If not, assign a random port
-  // to it.
-  LocalLayerThreeKey local_key;
-  {
-    std::unique_lock<std::mutex> bound_fds_lock(bound_fds_mutex_);
-    auto it = bound_fds_.find(sock_fd);
-    if (it == bound_fds_.end()) {
-      uint32 port = GetRandomPort();
-      local_key = LocalLayerThreeKey{ip_address_, port};
-      bound_fds_.emplace(sock_fd, local_key);
-    } else {
-      local_key = it->second;
-    }
-  }
-
-  std::shared_ptr<net_stack::Socket> socket;
-  {
-    std::unique_lock<std::mutex> sockets_lock(sockets_mutex_);
-    auto it = sockets_.find(sock_fd);
-    if (it == sockets_.end()) {
-      LogERROR("fd %d is not socket", sock_fd);
-      return false;
-    }
-    socket = it->second;
-  }
-
-  // Create TcpController and try establishing TCP connection with remote host.
-  // Note remote host is the "source" part in TcpControllerKey.
-  TcpControllerKey tcp_key{remote_ip, remote_port, 
-                           local_key.local_ip, local_key.local_port};
-  auto tcp_options = TcpController::GetDefaultOptions();
-  tcp_options.send_window_base = 0;  /* Utils::RandomNumber(); */
-  connections_.emplace(tcp_key,
-                       ptr::MakeUnique<TcpController>(
-                          this, tcp_key, socket, tcp_options));
-  auto tcp_con = connections_.at(tcp_key).get();
-  socket->tcp_con = tcp_con;
-
-  // Clean up steps.
-  auto clean_up = Utility::CleanUp([&]() {
-    ReleasePort(local_key.local_port);
-  });
-
-  // TcpController::TryConnect starts three-way handshake, by sending a SYNC
-  // segment to remote host.
-  bool re = tcp_con->TryConnect();
-  if (!re) {
-    return false;
-  }
-
-  clean_up.clear();
-  return true;
 }
 
 bool Host::ShutDown(int32 sock_fd) {
@@ -437,46 +555,6 @@ bool Host::Close(int32 sock_fd) {
   }
 
   return true;
-}
-
-uint32 Host::GetRandomPort() {
-  std::unique_lock<std::mutex> port_pool_lock(port_pool_mutex_);
-  uint32 size = port_pool_.size();
-  if (size == 0) {
-    return 0;
-  }
-  
-  // Select a random port from port pool.
-  uint32 index = Utils::RandomNumber(size);
-  auto it = port_pool_.begin();
-  advance(it, index);
-  uint32 port = *it;
-  port_pool_.erase(it);
-  return port;
-}
-
-void Host::ReleasePort(uint32 port) {
-  std::unique_lock<std::mutex> port_pool_lock(port_pool_mutex_);
-  port_pool_.insert(port);
-}
-
-int32 Host::GetFileDescriptor() {
-  std::unique_lock<std::mutex> fd_pool_lock(fd_pool_mutex_);
-
-  if (fd_pool_.empty()) {
-    return -1;
-  }
-
-  // Get the first (smallest) file descriptor available.
-  auto it = fd_pool_.begin();
-  int32 fd = *it;
-  fd_pool_.erase(it);
-  return fd;
-}
-
-void Host::ReleaseFileDescriptor(int32 fd) {
-  std::unique_lock<std::mutex> fd_pool_lock(fd_pool_mutex_);
-  fd_pool_.insert(fd);
 }
 
 void Host::debuginfo(const std::string& msg) {
