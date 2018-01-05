@@ -33,8 +33,8 @@ bool kEnableCongestionControl = false;
 }
 
 TcpController::TcpController(Host* host,
+                             Socket* socket,
                              const TcpControllerKey& tcp_key,
-                             std::shared_ptr<net_stack::Socket> socket,
                              const TcpControllerOptions& options) :
     host_(host),
     key_(tcp_key),
@@ -230,7 +230,7 @@ bool TcpController::HandleDataPacket(std::unique_ptr<Packet> pkt) {
   }
   if (closing &&
       pkt->tcp_header().seq_num > recv_window_.recv_base() &&
-      socket_->state == SocketState::CLOSED) {
+      socket_->state == Socket::CLOSED) {
     // Directly hand this packet to host to send out, rather than pushing it
     // to packet send buffer, to make sure this packet is sent out.
     std::queue<std::unique_ptr<Packet>> packets_to_send;
@@ -681,7 +681,7 @@ int32 TcpController::ReadData(byte* buf, int32 size) {
   // }
 
   if (pipe_state_.load() == EOF_READ) {
-    LogERROR("Broken pipe %d", socket_->fd);
+    LogERROR("Broken pipe");
     return -1;
   }
 
@@ -1006,10 +1006,6 @@ std::string TcpController::TcpStateStr(TCP_STATE state) {
     case LAST_ACK: return "LAST_ACK";
     default: return "UNKNOWN_TCP_STATE";
   }
-}
-
-int32 TcpController::socket_fd() const {
-  return socket_->fd;
 }
 
 }  // namespace net_stack

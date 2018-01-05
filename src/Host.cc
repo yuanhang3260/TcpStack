@@ -7,17 +7,23 @@
 namespace net_stack {
 
 namespace {
+
 // Process file descriptor available in [3, 64).
 const int32 kMinFd = 3;
 const int32 kMaxFd = 63;
+
 // Open file id available in [0, 256).
 const int32 kMinOpenFileId = 0;
 const int32 kMaxOpenFileId = 255;
+
 // Port available in [1024, 1024 + 128).
 const int32 kMinPort = 1024;
 const int32 kMaxPort = 1151;
-}
 
+}  // namespace
+
+
+// ************************************************************************** //
 // ***************************** Process ************************************ //
 Process::Process(Host* host) : host_(host) {
   fd_pool_ = ptr::MakeUnique<NumPool>(kMinFd, kMaxFd);
@@ -39,7 +45,7 @@ int32 Process::FindFdMappedFileId(int32 fd) {
 
 int32 Process::Socket() {
   // Allocate a new file descriptor.
-  int32 fd = fd_pool_.Allocate();
+  int32 fd = fd_pool_->Allocate();
   if (fd < 0) {
     return -1;
   }
@@ -52,7 +58,7 @@ int32 Process::Socket() {
 
   // Update process fd table.
   std::unique_lock<std::mutex> lock(fd_table_mutex_);
-  fd_table_->emplace(fd, open_file_id);
+  fd_table_.emplace(fd, open_file_id);
   return fd;
 }
 
@@ -73,7 +79,7 @@ bool Process::Listen(int32 socket_fd) {
   return host_->SocketListen(open_file_id);
 }
 
-int Process::Accept(int32 listen_socket) {
+int Process::Accept(int32 socket_fd) {
   int32 open_file_id = FindFdMappedFileId(socket_fd);
   if (open_file_id < 0) {
     return false;
@@ -83,7 +89,7 @@ int Process::Accept(int32 listen_socket) {
   // id associated with a newly created socket. Process should allocate a new
   // file descriptor and map it to the new open file.
   int32 new_open_file_id = host_->SocketAccept(open_file_id);
-  int32 new_fd = fd_pool_.Allocate();
+  int32 new_fd = fd_pool_->Allocate();
   if (new_fd < 0) {
     // TODO: What happens if allocating new fd fails? Kernel will still keep
     // the socket object in open file table, but no process fd will map to it.
@@ -96,8 +102,8 @@ int Process::Accept(int32 listen_socket) {
   }
 
   std::unique_lock<std::mutex> lock(fd_table_mutex_);
-  fd_table_->emplace(new_fd, new_open_file_id);
-  debuginfo("Accept fd = " + std::to_string(new_fd));
+  fd_table_.emplace(new_fd, new_open_file_id);
+  host_->debuginfo("Accept fd = " + std::to_string(new_fd));
   return new_fd;
 }
 
@@ -112,7 +118,7 @@ bool Process::Connect(int32 socket_fd,
 }
 
 int32 Process::Read(int32 fd, byte* buffer, int32 size) {
-  int32 open_file_id = FindFdMappedFileId(socket_fd);
+  int32 open_file_id = FindFdMappedFileId(fd);
   if (open_file_id < 0) {
     return false;
   }
@@ -120,7 +126,7 @@ int32 Process::Read(int32 fd, byte* buffer, int32 size) {
 }
 
 int32 Process::Write(int32 fd, const byte* buffer, int32 size) {
-  int32 open_file_id = FindFdMappedFileId(socket_fd);
+  int32 open_file_id = FindFdMappedFileId(fd);
   if (open_file_id < 0) {
     return false;
   }
@@ -128,7 +134,7 @@ int32 Process::Write(int32 fd, const byte* buffer, int32 size) {
 }
 
 bool Process::ShutDown(int32 fd) {
-  int32 open_file_id = FindFdMappedFileId(socket_fd);
+  int32 open_file_id = FindFdMappedFileId(fd);
   if (open_file_id < 0) {
     return false;
   }
@@ -149,7 +155,7 @@ bool Process::Close(int32 fd) {
 
   int refs = host_->DecOpenFileRef(open_file_id);
   if (refs == 0) {
-    host_->ShutDownSocket(open_file_id));
+    host_->ShutDownSocket(open_file_id);
   }
 
   // Release file descriptor in this process.
@@ -166,6 +172,7 @@ bool Process::Close(int32 fd) {
   return true;
 }
 
+// ************************************************************************** //
 // ******************************* Host ************************************* //
 Host::Host(const std::string& hostname, const std::string& ip_address,
            BaseChannel* channel) :
@@ -233,7 +240,7 @@ int32 Host::DecOpenFileRef(int32 open_file_id) {
   }
 
   if (it->second->Refs() <= 1) {
-    it->second->socket->Reset();
+    it->second->socket.Reset();
     open_files_table_.erase(it);
     return 0;
   } else {
@@ -251,20 +258,21 @@ int32 Host::IncOpenFileRef(int32 open_file_id) {
     return false;
   }
 
-  it->second->InccRef();
+  it->second->IncRef();
   return it->second->Refs();
 }
 
 std::pair<int32, Socket*> Host::CreateNewSocket() {
-  int32 id = open_file_id_pool_.Allocate();
+  int32 id = open_file_id_pool_->Allocate();
   if (id < 0) {
     return std::make_pair<int32, Socket*>(-1, nullptr);
   }
 
   std::unique_lock<std::mutex> lock(open_files_table_mutex_);
-  open_files_table_.emplace(id, ptr::MakeUnique<KernelOpenFile>(SOCKET));
+  open_files_table_.emplace(
+      id, ptr::MakeUnique<KernelOpenFile>(KernelOpenFile::SOCKET));
   open_files_table_.at(id)->IncRef();
-  return std::make_pair<int32, Socket*>(id, open_files_table_.at(id).get());
+  return std::make_pair(id, &open_files_table_.at(id)->socket);
 }
 
 bool Host::SocketBind(int32 open_file_id,
@@ -280,7 +288,7 @@ bool Host::SocketBind(int32 open_file_id,
     return false;
   }
 
-  if (!port_pool_.Take(local_port)) {
+  if (!port_pool_->Take(local_port)) {
     LogERROR("Could not bind to local_port %d which is already being used.");
     return false;
   }
@@ -299,9 +307,15 @@ bool Host::SocketListen(int32 open_file_id) {
   std::unique_lock<std::mutex> listeners_lock(listeners_mutex_);
   std::unique_ptr<Listener> listener(new Listener);
   listeners_.emplace(local_listener_key, std::move(listener));
+  return true;
 }
 
-bool Host::SocketAccept(int32 open_file_id) {
+int32 Host::SocketAccept(int32 open_file_id) {
+  LocalLayerThreeKey local_listener_key;
+  if (!GetSocketLocalBound(open_file_id, &local_listener_key)) {
+    return false;
+  }
+
   // Get socket listener.
   Listener* listener = nullptr;
   {
@@ -309,7 +323,7 @@ bool Host::SocketAccept(int32 open_file_id) {
     auto it = listeners_.find(local_listener_key);
     if (it == listeners_.end()) {
       LogERROR("Socket is not in listening mode");
-      return false;
+      return -1;
     }
     listener = it->second.get();
   }
@@ -318,9 +332,9 @@ bool Host::SocketAccept(int32 open_file_id) {
   std::unique_lock<std::mutex> listener_lock(listener->mutex);
   listener->cv.wait(listener_lock,
                     [&] {return !listener->tcp_sockets.empty(); });
-  int open_file_id = listener->tcp_sockets.front();
+  int new_open_file_id = listener->tcp_sockets.front();
   listener->tcp_sockets.pop();
-  return open_file_id;
+  return new_open_file_id;
 }
 
 bool Host::SocketConnect(int32 open_file_id,
@@ -331,7 +345,7 @@ bool Host::SocketConnect(int32 open_file_id,
   Socket* socket = GetSocket(open_file_id);
   if (!socket->isBound()) {
     local_key = LocalLayerThreeKey{local_ip_address_,
-                                   port_pool_.AllocateRandom()};
+                                   port_pool_->AllocateRandom()};
     socket->Bind(local_key);
   } else {
     local_key = socket->local_bound;
@@ -339,13 +353,13 @@ bool Host::SocketConnect(int32 open_file_id,
 
   // Create TcpController and try establishing TCP connection with remote host.
   // Note remote host is the "source" part in TcpControllerKey.
-  TcpControllerKey tcp_key{remote_ip, remote_port, 
-                           local_key.local_ip, local_key.local_port};
+  TcpControllerKey tcp_key(remote_ip, remote_port, 
+                           local_key.local_ip, local_key.local_port);
   auto tcp_options = TcpController::GetDefaultOptions();
   tcp_options.send_window_base = 0;  /* Utils::RandomNumber(); */
   connections_.emplace(tcp_key,
                        ptr::MakeUnique<TcpController>(
-                          this, tcp_key, socket, tcp_options));
+                          this, socket, tcp_key, tcp_options));
   auto tcp_con = connections_.at(tcp_key).get();
   socket->tcp_con = tcp_con;
 
@@ -430,8 +444,8 @@ bool Host::HandleNewConnection(const Packet& pkt) {
   }
 
   // Check if any socket is listening on this port.
-  LocalLayerThreeKey key{pkt.ip_header().source_ip,
-                         pkt.tcp_header().source_port};
+  LocalLayerThreeKey key(pkt.ip_header().source_ip,
+                         pkt.tcp_header().source_port);
   std::unique_lock<std::mutex> listeners_lock(listeners_mutex_);
   auto it = listeners_.find(key);
   if (it == listeners_.end()) {
@@ -466,7 +480,7 @@ bool Host::HandleNewConnection(const Packet& pkt) {
     std::unique_lock<std::mutex> connections_lock(connections_mutex_);
     connections_.emplace(tcp_key,
                          ptr::MakeUnique<TcpController>(
-                            this, tcp_key, socket, tcp_options));
+                            this, socket, tcp_key, tcp_options));
     socket->tcp_con = connections_.at(tcp_key).get();
   }
 
@@ -534,7 +548,7 @@ int32 Host::ReadData(int32 open_file_id, byte* buffer, int32 size) {
   // and it should reply RST to the other side, indicating no more data is
   // acceptable. If FIN is sent by ShutDown(), TCP connection can still receive
   // data until the other side sends a FIN.
-  if (socket->state == CLOSED) {
+  if (socket->state == Socket::CLOSED) {
     LogERROR("Socket has been closed, can't recv data");
     return -1;
   }
@@ -542,7 +556,7 @@ int32 Host::ReadData(int32 open_file_id, byte* buffer, int32 size) {
   return tcp_con->ReadData(buffer, size);
 }
 
-int32 Host::WriteData(int32 socket_fd, const byte* buffer, int32 size) {
+int32 Host::WriteData(int32 open_file_id, const byte* buffer, int32 size) {
   Socket* socket = GetSocket(open_file_id);
   if (socket == nullptr) {
     return -1;
@@ -552,7 +566,7 @@ int32 Host::WriteData(int32 socket_fd, const byte* buffer, int32 size) {
   // Prevent sending data after socket is closed or shutdown. Note this check
   // resides in socket layer rather TCP layer. As a double check, TCP also
   // checks TCP state and blocks sending data if FIN is already sent.
-  if (socket->state == SHUTDOWN || socket->state == CLOSED) {
+  if (socket->state == Socket::SHUTDOWN || socket->state == Socket::CLOSED) {
     LogERROR("Socket has been shut down, can't send data");
     return -1;
   }
@@ -571,7 +585,7 @@ bool Host::ShutDownSocket(int32 open_file_id) {
     return -1;
   }
   TcpController* tcp_con = socket->tcp_con;
-  socket->state = SHUTDOWN;
+  socket->state = Socket::SHUTDOWN;
 
   // TCP connection shutdown - It sends FIN to the other side to indicate end
   // of sending data. The socket is not closed, and process file descriptor can

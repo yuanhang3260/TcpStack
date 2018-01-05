@@ -1,10 +1,14 @@
 #include "NumPool.h"
 
 #include "Base/Log.h"
+#include "Base/Utils.h"
+
+namespace net_stack {
 
 NumPool::NumPool(const std::string& name, int32 min, int32 max) :
-  NumPool(min, max),
-  name_(name) {}
+    NumPool(min, max) {
+  name_ = name;
+}
 
 NumPool::NumPool(int min, int max) {
   for (int32 i = min; i <= max; i++) {
@@ -41,7 +45,7 @@ int32 NumPool::AllocateRandom() {
   if (size == 0) {
     return -1;
   }
-  
+
   // Select a random port from port pool.
   uint32 index = Utils::RandomNumber(size);
   auto it = pool_.begin();
@@ -51,10 +55,12 @@ int32 NumPool::AllocateRandom() {
   return num;
 }
 
-void Host::Release(int32 num) {
+void NumPool::Release(int32 num) {
   if (!name_.empty()) {
     LogINFO("%s releasing %d", name_.c_str(), num);
   }
   std::unique_lock<std::mutex> lock(mutex_);
   pool_.insert(num);
 }
+
+}  // namespace net_stack

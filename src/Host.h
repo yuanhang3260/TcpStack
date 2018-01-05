@@ -43,6 +43,8 @@ class Process {
   bool Close(int32 fd);
 
  private:
+  int32 FindFdMappedFileId(int32 fd);
+
   // Kernel ref.
   Host* host_;
 
@@ -50,7 +52,7 @@ class Process {
   std::unique_ptr<NumPool> fd_pool_;
 
   // Process file descriptor table.
-  std::map<int32, id> fd_table_;
+  std::map<int32, int32> fd_table_;
   std::mutex fd_table_mutex_;
 };
 
@@ -72,10 +74,6 @@ class Host {
   // Remove a tcp connection and release all its resource.
   void DeleteTcpConnection(const TcpControllerKey& tcp_key);
 
-  // Read and write data with socket.
-  int32 ReadData(int32 socket_fd, byte* buffer, int32 size);
-  int32 WriteData(int32 socket_fd, const byte* buffer, int32 size);
-
   // System calls implementations.
   std::pair<int32, Socket*> CreateNewSocket();
 
@@ -84,10 +82,15 @@ class Host {
 
   bool SocketListen(int32 open_file_id);
 
-  int SocketAccept(int32 open_file_id);
+  int32 SocketAccept(int32 open_file_id);
 
   bool SocketConnect(int32 open_file_id,
                      const std::string& remote_ip, uint32 remote_port);
+
+  int32 ReadData(int32 open_file_id, byte* buffer, int32 size);
+  int32 WriteData(int32 open_file_id, const byte* buffer, int32 size);
+
+  bool ShutDownSocket(int32 open_file_id);
 
   std::string hostname() const { return hostname_; }
   std::string ip_address() const { return local_ip_address_; }
@@ -154,6 +157,8 @@ class Host {
 
   // Thread pool.
   Executors::FixedThreadPool thread_pool_;
+
+  friend class Process;
 };
 
 }  // namespace net_stack

@@ -8,84 +8,22 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
 
-#include "BaseChannel.h"
-#include "Common.h"
-#include "PacketQueue.h"
-#include "RecvWindow.h"
-#include "SendWindow.h"
 #include "Strings/Utils.h"
 #include "Utility/InfiniteBuffer.h"
 #include "Utility/RingBuffer.h"
 #include "Utility/ThreadPool.h"
 #include "Utility/Timer.h"
 
+#include "BaseChannel.h"
+#include "Kernel.h"
+#include "PacketQueue.h"
+#include "RecvWindow.h"
+#include "SendWindow.h"
+
 namespace net_stack {
 
 class Host;
-class Socket;
-
-// TCP uses <source_ip, source_port, dest_ip, dest_port> as unique indentifier.
-struct TcpControllerKey {
-  std::string source_ip;
-  uint32 source_port = 0;
-  std::string dest_ip;
-  uint32 dest_port = 0;
-
-  bool operator==(const TcpControllerKey &other) const { 
-    return (source_ip == other.source_ip && source_port == other.source_port &&
-            dest_ip == other.dest_ip && dest_port == other.dest_port);
-  }
-
-  bool operator<(const TcpControllerKey &other) const {
-    if (source_ip != other.source_ip) {
-      return source_ip < other.source_ip;
-    }
-    if (source_port != other.source_port) {
-      return source_port < other.source_port;
-    }
-    if (dest_ip != other.dest_ip) {
-      return dest_ip < other.dest_ip;
-    }
-    if (dest_port != other.dest_port) {
-      return dest_port < other.dest_port;
-    }
-
-    return false;
-  }
-
-  std::string DebugString() const {
-    return Strings::StrCat("{", source_ip, ":", std::to_string(source_port),
-                           ", ", dest_ip, ":", std::to_string(dest_port), "}");
-  }
-};
-
-// Local listener key. It only bundles {local ip, local_port} as key.
-struct LocalLayerThreeKey {
-  std::string local_ip;
-  uint32 local_port = 0;
-
-  bool operator==(const LocalLayerThreeKey &other) const { 
-    return local_ip == other.local_ip && local_port == other.local_port;
-  }
-
-  bool operator<(const LocalLayerThreeKey &other) const {
-    if (local_ip != other.local_ip) {
-      return local_ip < other.local_ip;
-    }
-    if (local_port != other.local_port) {
-      return local_port < other.local_port;
-    }
-
-    return false;
-  }
-
-  std::string DebugString() const {
-    return Strings::StrCat("{", local_ip, ", ",
-                           std::to_string(local_port), "}");
-  }
-};
 
 struct TcpControllerOptions {
   uint32 send_buffer_size;
@@ -113,8 +51,8 @@ class TcpController {
     LAST_ACK,
   };
 
-  TcpController(Host* host, const TcpControllerKey& tcp_id,
-                std::shared_ptr<net_stack::Socket> socket_,
+  TcpController(Host* host, Socket* socket,
+                const TcpControllerKey& tcp_key,
                 const TcpControllerOptions& options);
   ~TcpController();
 
@@ -138,8 +76,6 @@ class TcpController {
 
   // This is called by host to wait for this connection object can be deleted.
   void WaitForReadyToDestroy();
-
-  int32 socket_fd() const;
 
  private:
   // These methods serve uplink packet/data delivery (receive data).
@@ -201,7 +137,7 @@ class TcpController {
 
   Host* host_ = nullptr;
   TcpControllerKey key_;
-  std::shared_ptr<net_stack::Socket> socket_;
+  Socket* socket_ = nullptr;
 
   Executors::FixedThreadPool thread_pool_;
 
@@ -289,31 +225,5 @@ class TcpController {
 };
 
 }  // namespace net_stack
-
-
-namespace std {
-template <>
-struct hash<net_stack::TcpControllerKey> {
-  size_t operator() (const net_stack::TcpControllerKey& tcp_id) const {
-    std::hash<std::string> str_hasher;
-    std::hash<int> int_hasher;
-      return ((str_hasher(tcp_id.source_ip) ^
-              (int_hasher(tcp_id.source_port) << 1)) >> 1) ^
-             (((str_hasher(tcp_id.dest_ip) << 2) ^
-               (int_hasher(tcp_id.dest_port) << 2)) >> 2);
-  }
-};
-
-template <>
-struct hash<net_stack::LocalLayerThreeKey> {
-  size_t operator() (const net_stack::LocalLayerThreeKey& id) const {
-    std::hash<std::string> str_hasher;
-    std::hash<int> int_hasher;
-      return ((str_hasher(id.local_ip) ^
-              (int_hasher(id.local_port) << 1)) >> 1);
-  }
-};
-
-}  // namespace
 
 #endif  // NET_STACK_TCP_CONTROLLER_
