@@ -147,12 +147,9 @@ bool TcpController::TryShutDown() {
     }
   }
 
-  // TODO: Set socket state to prevent further user call of Write().
-
   // Send FIN segment. It waits for socket send buffer to be cleared and then
   // enqueue the FIN segment.
   SendFIN();
-
   return true;
 }
 
@@ -174,6 +171,7 @@ void TcpController::SendFIN() {
       LogFATAL("Failed to send FIN segment");
     }
   }
+
   {
     std::unique_lock<std::mutex> state_lock(state_mutex_);
     if (state_ == ESTABLISHED) {

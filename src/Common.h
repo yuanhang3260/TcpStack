@@ -20,11 +20,13 @@ struct Socket {
     SHUTDOWN,
   };
 
+  Socket() = default;
+
   void Bind(const LocalLayerThreeKey& key);
   void Bind(const std::string& local_ip, uint32 local_port);
   bool isBound() const;
 
-  Socket() = default;
+  void Reset();
 
   Socket::State state = OPEN;
   LocalLayerThreeKey local_bound;

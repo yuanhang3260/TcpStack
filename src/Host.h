@@ -36,6 +36,12 @@ class Process {
   bool Connect(int32 socket_fd,
                const std::string& remote_ip, uint32 remote_port);
 
+  int32 Read(int32 fd, byte* buffer, int32 size);
+  int32 Write(int32 fd, const byte* buffer, int32 size);
+
+  bool ShutDown(int32 fd);
+  bool Close(int32 fd);
+
  private:
   // Kernel ref.
   Host* host_;
@@ -83,9 +89,6 @@ class Host {
   bool SocketConnect(int32 open_file_id,
                      const std::string& remote_ip, uint32 remote_port);
 
-  bool ShutDown(int32 sock_fd);
-  bool Close(int32 sock_fd);
-
   std::string hostname() const { return hostname_; }
   std::string ip_address() const { return local_ip_address_; }
 
@@ -94,6 +97,10 @@ class Host {
 
   Socket* GetSocket(int32 open_file_id);
   bool GetSocketLocalBound(int32 open_file_id, LocalLayerThreeKey* key);
+  
+  // Return reference count after function call.
+  int32 DecOpenFileRef(int32 open_file_id);
+  int32 IncOpenFileRef(int32 open_file_id);
 
   void PacketsReceiveListener();
   void DemultiplexPacketsToTcps(
@@ -131,17 +138,6 @@ class Host {
   TcpConnectionMap connections_;
   std::mutex connections_mutex_;
 
-  // All sockets currently mapped to file descriptor.
-  std::unordered_map<int32, std::shared_ptr<net_stack::Socket>> sockets_;
-  std::mutex sockets_mutex_;
-
-  // All available ports.
-  std::unique_ptr<NumPool> port_pool_;
-
-  // Sockets that have been bound to port.
-  std::unordered_map<int32, LocalLayerThreeKey> bound_sockets_;
-  std::mutex bound_sockets_mutex_;
-
   // Local listeners.
   struct Listener {
     // This is a queue of populated sockets assigned to each new TCP connection.
@@ -152,6 +148,9 @@ class Host {
   };
   std::unordered_map<LocalLayerThreeKey, std::unique_ptr<Listener>> listeners_;
   std::mutex listeners_mutex_;
+
+  // All available ports.
+  std::unique_ptr<NumPool> port_pool_;
 
   // Thread pool.
   Executors::FixedThreadPool thread_pool_;

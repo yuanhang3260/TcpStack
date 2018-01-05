@@ -1,8 +1,9 @@
 #ifndef NET_STACK_NUM_POOL_
 #define NET_STACK_NUM_POOL_
 
-#include <set>
 #include <mutex>
+#include <set>
+#include <string>
 
 #include "Base/BaseTypes.h"
 
@@ -13,6 +14,7 @@ namespace net_stack {
 // is thread-safe.
 class NumPool {
  public:
+  NumPool(const std::string& name, int32 min, int32 max);
   NumPool(int32 min, int32 max);
 
   // Allocate number from pool.
@@ -24,6 +26,8 @@ class NumPool {
   void Release(int32);
 
  private:
+  std::string name_;
+
   std::set<int32> pool_;
   std::mutex mutex_;
 };

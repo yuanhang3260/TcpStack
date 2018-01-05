@@ -30,7 +30,7 @@ int32 Process::FindFdMappedFileId(int32 fd) {
   std::unique_lock<std::mutex> lock(fd_table_mutex_);
   auto it = fd_table_.find(fd);
   if (it == fd_table_.end()) {
-    LogERROR("Invalid fd %d, not allocated");
+    LogERROR("Invalid fd %d, not allocated. Is it closed?");
     return -1;
   }
   int32 open_file_id = it->second;
@@ -111,6 +111,61 @@ bool Process::Connect(int32 socket_fd,
   return host_->SocketConnect(open_file_id, remote_ip, remote_port);
 }
 
+int32 Process::Read(int32 fd, byte* buffer, int32 size) {
+  int32 open_file_id = FindFdMappedFileId(socket_fd);
+  if (open_file_id < 0) {
+    return false;
+  }
+  return host_->ReadData(open_file_id, buffer, size);
+}
+
+int32 Process::Write(int32 fd, const byte* buffer, int32 size) {
+  int32 open_file_id = FindFdMappedFileId(socket_fd);
+  if (open_file_id < 0) {
+    return false;
+  }
+  return host_->WriteData(open_file_id, buffer, size);
+}
+
+bool Process::ShutDown(int32 fd) {
+  int32 open_file_id = FindFdMappedFileId(socket_fd);
+  if (open_file_id < 0) {
+    return false;
+  }
+  return host_->ShutDownSocket(open_file_id);
+}
+
+bool Process::Close(int32 fd) {
+  // Close() is different from ShutDown(). Close() just closes the process
+  // file descriptor that maps to the open file entry of this socket. It will
+  // decrease the open file reference count. When reference count becomes zero,
+  // TCP socket will be shutdown, by sending a FIN to the other side.
+  //
+  // Of course, process itself should recycle the fd when Close() is called.
+  int32 open_file_id = FindFdMappedFileId(fd);
+  if (open_file_id < 0) {
+    return false;
+  }
+
+  int refs = host_->DecOpenFileRef(open_file_id);
+  if (refs == 0) {
+    host_->ShutDownSocket(open_file_id));
+  }
+
+  // Release file descriptor in this process.
+  {
+    std::unique_lock<std::mutex> lock(fd_table_mutex_);
+    auto it = fd_table_.find(fd);
+    if (it == fd_table_.end()) {
+      return false;
+    }
+    fd_table_.erase(it);
+  }
+
+  fd_pool_->Release(fd);
+  return true;
+}
+
 // ******************************* Host ************************************* //
 Host::Host(const std::string& hostname, const std::string& ip_address,
            BaseChannel* channel) :
@@ -144,7 +199,7 @@ Socket* Host::GetSocket(int32 open_file_id) {
   }
 
   if (it->second->type != KernelOpenFile::SOCKET) {
-    LogERROR("Could not bind port %d to open file id %d which is not a socket");
+    LogERROR("Could not get socket from open file id %d which is not a socket");
     return nullptr;
   }
 
@@ -162,7 +217,42 @@ bool Host::GetSocketLocalBound(int32 open_file_id, LocalLayerThreeKey* key) {
     return false;
   }
   *key = socket->local_bound;
-  return true
+  return true;
+}
+
+int32 Host::DecOpenFileRef(int32 open_file_id) {
+  // We keep the big lock of entire function, and we don't lock for single
+  // table entries that is being operated on. This is neccessary because we
+  // need to rule out any race condition when looking at the reference count
+  // of the table entry.
+  std::unique_lock<std::mutex> lock(open_files_table_mutex_);
+  auto it = open_files_table_.find(open_file_id);
+  if (it == open_files_table_.end()) {
+    LogERROR("Could not find open file id %d", open_file_id);
+    return -1;
+  }
+
+  if (it->second->Refs() <= 1) {
+    it->second->socket->Reset();
+    open_files_table_.erase(it);
+    return 0;
+  } else {
+    it->second->DecRef();
+    return it->second->Refs();
+  }
+}
+
+int32 Host::IncOpenFileRef(int32 open_file_id) {
+  // Same as DecOpenFileRef.
+  std::unique_lock<std::mutex> lock(open_files_table_mutex_);
+  auto it = open_files_table_.find(open_file_id);
+  if (it == open_files_table_.end()) {
+    LogERROR("Could not find open file id %d", open_file_id);
+    return false;
+  }
+
+  it->second->InccRef();
+  return it->second->Refs();
 }
 
 std::pair<int32, Socket*> Host::CreateNewSocket() {
@@ -179,11 +269,6 @@ std::pair<int32, Socket*> Host::CreateNewSocket() {
 
 bool Host::SocketBind(int32 open_file_id,
                       const std::string& local_ip, uint32 local_port) {
-  if (!port_pool_.Take(local_port)) {
-    LogERROR("Could not bind to local_port %d which is already being used.");
-    return false;
-  }
-
   Socket* socket = GetSocket(open_file_id);
   if (socket == nullptr) {
     return false;
@@ -192,6 +277,11 @@ bool Host::SocketBind(int32 open_file_id,
   if (socket->isBound()) {
     LogERROR("Could not bind open file id %d which is already bound to port %d",
              open_file_id, socket->local_bound.local_port);
+    return false;
+  }
+
+  if (!port_pool_.Take(local_port)) {
+    LogERROR("Could not bind to local_port %d which is already being used.");
     return false;
   }
 
@@ -396,6 +486,7 @@ void Host::MultiplexPacketsFromTcp(
 void Host::PacketsSendListener() {
   while (true) {
     std::queue<std::unique_ptr<Packet>> packets_to_send;
+    // Block reading from packet send queue.
     send_pkt_queue_.DeQueueAllTo(&packets_to_send);
     // Send to channel.
     channel_->Send(&packets_to_send);
@@ -418,38 +509,20 @@ void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
   // Wait for this connection is ready to be deleted.
   tcp_con->WaitForReadyToDestroy();
 
-  // Reset the socket. It now can be bound to other TCP connections (e.g. call
-  // Connect on the fd to create new TCP connection).
-  int32 socket_fd = tcp_con->socket_fd();
-  if (socket_fd > 0) {
-    std::unique_lock<std::mutex> lock(sockets_mutex_);
-    auto it = sockets_.find(socket_fd);
-    if (it != sockets_.end()) {
-      it->second->tcp_con = nullptr;
-      it->second->state = OPEN;
-    }
-  }
-
-  // Release port.
-  port_pool_.Release(tcp_key.dest_port);
+  // TODO: Server should delete socket from open file table? Maybe not.
+  // It should only be deleted when the file descriptor is closed and open
+  // file reference count is zero.
 
   debuginfo(Strings::StrCat(
       "Connection ", tcp_key.DebugString(), " safely deleted ^_^"));
 }
 
-int32 Host::ReadData(int32 socket_fd, byte* buffer, int32 size) {
-  TcpController* tcp_con;
-  SocketState socket_state;
-  {
-    std::unique_lock<std::mutex> lock(sockets_mutex_);
-    auto it = sockets_.find(socket_fd);
-    if (it == sockets_.end()) {
-      LogERROR("Can't find socket %d", socket_fd);
-      return -1;
-    }
-    socket_state = it->second->state;
-    tcp_con = it->second->tcp_con;
+int32 Host::ReadData(int32 open_file_id, byte* buffer, int32 size) {
+  Socket* socket = GetSocket(open_file_id);
+  if (socket == nullptr) {
+    return -1;
   }
+  TcpController* tcp_con = socket->tcp_con;
 
   // If socket state is closed, prevent user reading data from this socket.
   // Note this check resides in socket layer.
@@ -461,7 +534,7 @@ int32 Host::ReadData(int32 socket_fd, byte* buffer, int32 size) {
   // and it should reply RST to the other side, indicating no more data is
   // acceptable. If FIN is sent by ShutDown(), TCP connection can still receive
   // data until the other side sends a FIN.
-  if (socket_state == CLOSED) {
+  if (socket->state == CLOSED) {
     LogERROR("Socket has been closed, can't recv data");
     return -1;
   }
@@ -470,87 +543,42 @@ int32 Host::ReadData(int32 socket_fd, byte* buffer, int32 size) {
 }
 
 int32 Host::WriteData(int32 socket_fd, const byte* buffer, int32 size) {
-  TcpController* tcp_con;
-  SocketState socket_state;
-  {
-    std::unique_lock<std::mutex> lock(sockets_mutex_);
-    auto it = sockets_.find(socket_fd);
-    if (it == sockets_.end()) {
-      LogERROR("Can't find socket %d", socket_fd);
-      return -1;
-    }
-    socket_state = it->second->state;
-    tcp_con = it->second->tcp_con;
+  Socket* socket = GetSocket(open_file_id);
+  if (socket == nullptr) {
+    return -1;
   }
+  TcpController* tcp_con = socket->tcp_con;
 
   // Prevent sending data after socket is closed or shutdown. Note this check
   // resides in socket layer rather TCP layer. As a double check, TCP also
   // checks TCP state and blocks sending data if FIN is already sent.
-  if (socket_state == SHUTDOWN || socket_state == CLOSED) {
+  if (socket->state == SHUTDOWN || socket->state == CLOSED) {
     LogERROR("Socket has been shut down, can't send data");
     return -1;
   }
 
+  // TODO: Read TCP connection status. If the other side has sent an RST,
+  // return -1 immediately. In real Linux system, kernel will send a SIGPIPE 
+  // signal to process and the default action is to terminate the process.
+  // Here we just return -1 instead.
+
   return tcp_con->WriteData(buffer, size);
 }
 
-bool Host::ShutDown(int32 sock_fd) {
-  TcpController* tcp_con = nullptr;
-  {
-    std::unique_lock<std::mutex> lock(sockets_mutex_);
-    auto it = sockets_.find(sock_fd);
-    if (it == sockets_.end()) {
-      LogERROR("Can't find socket %u", sock_fd);
-      return false;
-    }
-    auto socket = it->second.get();
-    tcp_con = socket->tcp_con;
-    socket->state = SHUTDOWN;
+bool Host::ShutDownSocket(int32 open_file_id) {
+  Socket* socket = GetSocket(open_file_id);
+  if (socket == nullptr) {
+    return -1;
   }
+  TcpController* tcp_con = socket->tcp_con;
+  socket->state = SHUTDOWN;
 
-  // Tcp connection shutdown - It sends FIN to the other side.
+  // TCP connection shutdown - It sends FIN to the other side to indicate end
+  // of sending data. The socket is not closed, and process file descriptor can
+  // still be used to read data from this socket.
   auto re = tcp_con->TryShutDown();
   if (!re) {
-    // TODO: Close fail?
-    return false;
-  }
-
-  return true;
-}
-
-bool Host::Close(int32 sock_fd) {
-  // Close() is different with ShutDown() in that it closes both direction
-  // communication of this socket.
-  //
-  // More importantly, it dec-couples the fd from TCP connection, which
-  // means this TCP connection is no longer bound with any fd, and this
-  // file descriptor will be recycled by system.
-  TcpController* tcp_con = nullptr;
-  {
-    std::unique_lock<std::mutex> lock(sockets_mutex_);
-    auto it = sockets_.find(sock_fd);
-    if (it == sockets_.end()) {
-      LogERROR("Can't find socket %u in use", sock_fd);
-      return false;
-    }
-    auto socket = it->second.get();
-    tcp_con = socket->tcp_con;
-    socket->state = CLOSED;
-    socket->fd = -1;
-
-    // Remove the socket from (fd --> socket) map. This fd will be released
-    // in the following ReleaseFileDescriptor. Now only TCP connection itself
-    // is still holding the reference of Socket, with socket state CLOSED.
-    sockets_.erase(it);
-  }
-
-  // Release the file descriptor.
-  ReleaseFileDescriptor(sock_fd);
-
-  // Tcp connection shutdown - It sends FIN to the other side.
-  auto re = tcp_con->TryShutDown();
-  if (!re) {
-    // TODO: Close fail?
+    // TODO: Shutdown fail?
     return false;
   }
 

@@ -2,6 +2,12 @@
 
 namespace net_stack {
 
+void Socket::Reset() {
+  state = CLOSED;
+  tcp_con = nullptr;
+  local_bound = LocalLayerThreeKey();
+}
+
 void Socket::Bind(const LocalLayerThreeKey& key) {
   local_bound = key;
 }
