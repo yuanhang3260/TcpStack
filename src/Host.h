@@ -21,11 +21,18 @@
 namespace net_stack {
 
 class Host;
+class Process;
+
+// Program is the function that Process actually executes. Argument process is
+// the system call interface.
+using Program = std::function<void(Process* process)>;
 
 class Process {
  public:
-  Process(Host* host);
+  Process(Host* host, const std::string& name, Program program);
   ~Process();
+
+  void Run();
 
   // "System Calls".
   int32 Socket();
@@ -47,6 +54,8 @@ class Process {
 
   // Kernel ref.
   Host* host_;
+  std::string name_;
+  Program program_;
 
   // All available file descriptors.
   std::unique_ptr<NumPool> fd_pool_;
@@ -61,6 +70,11 @@ class Host {
   Host(const std::string& hostname, const std::string& ip_address,
        BaseChannel* channel);
   ~Host();
+
+  void RunForever();
+
+  // Create Process.
+  bool CreateProcess(const std::string& name, Program program);
 
   // This is the callback passed to channel. Channel use it to move packets
   // to host's receive queue.
@@ -91,6 +105,7 @@ class Host {
   int32 WriteData(int32 open_file_id, const byte* buffer, int32 size);
 
   bool ShutDownSocket(int32 open_file_id);
+  bool CloseSocket(int32 open_file_id);
 
   std::string hostname() const { return hostname_; }
   std::string ip_address() const { return local_ip_address_; }
@@ -124,6 +139,10 @@ class Host {
   std::string hostname_;
   std::string local_ip_address_;  // Human readable IP address (aa.bb.cc.dd)
   BaseChannel* channel_;  // This is the channel to send packets.
+
+  // All processes.
+  std::map<std::string, std::unique_ptr<Process>> processes_;
+  std::mutex processes_mutex_;
 
   // Receive packets queue.
   PacketQueue recv_pkt_queue_;

@@ -3,7 +3,7 @@
 namespace net_stack {
 
 void Socket::Reset() {
-  state = CLOSED;
+  state = OPEN;
   tcp_con = nullptr;
   local_bound = LocalLayerThreeKey();
 }

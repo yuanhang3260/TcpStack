@@ -16,10 +16,7 @@ class TcpController;
 struct Socket {
   enum State {
     OPEN,
-    EOF_NOT_READ,
-    EOF_READ,
-    CLOSED,
-    SHUTDOWN,
+    SHUTDOWN,  // This is SHUT_WR, no more data will be sent.
   };
 
   Socket() = default;

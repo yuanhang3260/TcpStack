@@ -25,8 +25,15 @@ const int32 kMaxPort = 1151;
 
 // ************************************************************************** //
 // ***************************** Process ************************************ //
-Process::Process(Host* host) : host_(host) {
+Process::Process(Host* host, const std::string& name, Program program) :
+    host_(host),
+    name_(name),
+    program_(program) {
   fd_pool_ = ptr::MakeUnique<NumPool>(kMinFd, kMaxFd);
+}
+
+void Process::Run() {
+  program_(this);
 }
 
 Process::~Process() {}
@@ -179,12 +186,11 @@ Host::Host(const std::string& hostname, const std::string& ip_address,
     hostname_(hostname),
     local_ip_address_(ip_address),
     channel_(channel),
-    thread_pool_(5) {
+    thread_pool_(20) {
   Initialize();
 
   thread_pool_.AddTask(std::bind(&Host::PacketsReceiveListener, this));
   thread_pool_.AddTask(std::bind(&Host::PacketsSendListener, this));
-  thread_pool_.Start();
 }
 
 Host::~Host() {
@@ -192,9 +198,23 @@ Host::~Host() {
   send_pkt_queue_.Stop();
 }
 
+void Host::RunForever() {
+  thread_pool_.Start();
+}
+
 void Host::Initialize() {
   open_file_id_pool_ = ptr::MakeUnique<NumPool>(kMinOpenFileId, kMaxOpenFileId);
   port_pool_ = ptr::MakeUnique<NumPool>(kMinPort, kMaxPort);
+}
+
+bool Host::CreateProcess(const std::string& name, Program program) {
+  std::unique_lock<std::mutex> lock(processes_mutex_);
+  processes_.emplace(name, ptr::MakeUnique<Process>(this, name, program));
+  Process* process = processes_.at(name).get();
+
+  // Run the process.
+  thread_pool_.AddTask(std::bind(&Process::Run, process));
+  return true;
 }
 
 Socket* Host::GetSocket(int32 open_file_id) {
@@ -520,12 +540,10 @@ void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
   connections_.erase(it);
   connections_lock.unlock();
 
-  // Wait for this connection is ready to be deleted.
+  // Wait for TCP connection cleaned up its internal resource and is ready to
+  // be deleted. Note in this function the TcpConnection will be detached from
+  // its socket.
   tcp_con->WaitForReadyToDestroy();
-
-  // TODO: Server should delete socket from open file table? Maybe not.
-  // It should only be deleted when the file descriptor is closed and open
-  // file reference count is zero.
 
   debuginfo(Strings::StrCat(
       "Connection ", tcp_key.DebugString(), " safely deleted ^_^"));
@@ -537,22 +555,6 @@ int32 Host::ReadData(int32 open_file_id, byte* buffer, int32 size) {
     return -1;
   }
   TcpController* tcp_con = socket->tcp_con;
-
-  // If socket state is closed, prevent user reading data from this socket.
-  // Note this check resides in socket layer.
-
-  // After FIN is sent, TCP layer's behavior on receiving new data depends on
-  // socket state. TCP layer needs to look at whether FIN is triggered by
-  // Close() or ShutDown(), by looking at current socket state. If FIN is sent
-  // by Close(), this TCP connection has no binding to user space anymore,
-  // and it should reply RST to the other side, indicating no more data is
-  // acceptable. If FIN is sent by ShutDown(), TCP connection can still receive
-  // data until the other side sends a FIN.
-  if (socket->state == Socket::CLOSED) {
-    LogERROR("Socket has been closed, can't recv data");
-    return -1;
-  }
-
   return tcp_con->ReadData(buffer, size);
 }
 
@@ -561,20 +563,23 @@ int32 Host::WriteData(int32 open_file_id, const byte* buffer, int32 size) {
   if (socket == nullptr) {
     return -1;
   }
-  TcpController* tcp_con = socket->tcp_con;
 
   // Prevent sending data after socket is closed or shutdown. Note this check
-  // resides in socket layer rather TCP layer. As a double check, TCP also
-  // checks TCP state and blocks sending data if FIN is already sent.
-  if (socket->state == Socket::SHUTDOWN || socket->state == Socket::CLOSED) {
-    LogERROR("Socket has been shut down, can't send data");
+  // resides in socket layer rather TCP layer.
+  if (socket->state == Socket::SHUTDOWN) {
+    LogERROR("Socket is shut down, can't send more data");
     return -1;
   }
 
-  // TODO: Read TCP connection status. If the other side has sent an RST,
-  // return -1 immediately. In real Linux system, kernel will send a SIGPIPE 
-  // signal to process and the default action is to terminate the process.
-  // Here we just return -1 instead.
+  TcpController* tcp_con = socket->tcp_con;
+  if (tcp_con == nullptr) {
+    // This socket has no TCP connection. This can happen when writing to a
+    // socket which has TCP connection already closed by the other side's RST.
+    // In real Linux system, kernel will send a SIGPIPE signal to process and
+    // the default behavior is terminating the process. Here we return -2
+    // to indicate this error. It should better be an enum, but I'm lazy.
+    return -2;
+  }
 
   return tcp_con->WriteData(buffer, size);
 }
@@ -593,6 +598,29 @@ bool Host::ShutDownSocket(int32 open_file_id) {
   auto re = tcp_con->TryShutDown();
   if (!re) {
     // TODO: Shutdown fail?
+    return false;
+  }
+
+  return true;
+}
+
+bool Host::CloseSocket(int32 open_file_id) {
+  // CloseSocket is very similar to ShutDownSocket, but just has one more step.
+  // Closing is bi-directional. A closed socket will never be able to receive
+  // data any more. So the mapped TCP connection should be notified of that
+  // fact. From now on, if this TCP connection's receive buffer is or becomes
+  // non-empty, TCP connection should send RST immediately to the other side
+  // to indicate a closed connection.
+  Socket* socket = GetSocket(open_file_id);
+  if (socket == nullptr) {
+    return -1;
+  }
+  TcpController* tcp_con = socket->tcp_con;
+  socket->state = Socket::SHUTDOWN;
+
+  // Note we call TcpController::TryClose, rather than TryShutDown.
+  auto re = tcp_con->TryClose();
+  if (!re) {
     return false;
   }
 

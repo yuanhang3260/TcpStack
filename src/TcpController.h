@@ -70,6 +70,7 @@ class TcpController {
 
   // Shut down a TCP connection. It sends a FIN segment.
   bool TryShutDown();
+  bool TryClose();
 
   // Terminate this connection. It stops all threads of this connection object.
   void TearDown();
@@ -79,7 +80,7 @@ class TcpController {
 
  private:
   // These methods serve uplink packet/data delivery (receive data).
-  void PacketReceiveBufferListner();
+  void PacketReceiveBufferListener();
   void HandleReceivedPackets(std::queue<std::unique_ptr<Packet>>* new_packets);
   bool HandleACK(std::unique_ptr<Packet> pkt);
   bool HandleSYN(std::unique_ptr<Packet> pkt);
@@ -91,18 +92,19 @@ class TcpController {
       std::shared_ptr<RecvWindow::RecvWindowNode> received_pkt_nodes);
 
   // These method serve down-link packet/data delivery (send data).
-  void SocketSendBufferListener();
+  void SendBufferListener();
   void SendPacket(std::unique_ptr<Packet> pkt);
   void PacketSendBufferListener();
 
   // Socket receive buffer listner. It waits for socket receive buffer to
   // become non-empty, and push overflowed packets into it.
-  void SocketReceiveBufferListener();
+  void ReceiveBufferListener();
   void PushOverflowedPacketsToSocketBuffer();
 
   void SendFIN();
 
   void CloseAndDelete();
+  void DetachSocket();
 
   // Timeout callback.
   void TimeoutReTransmitter();
@@ -119,6 +121,9 @@ class TcpController {
   std::shared_ptr<Packet> MakeFinPacket(uint32 seq_num);
 
   std::unique_ptr<Packet> MakeRstPacket();
+
+  void CloseConnection();
+  void SendRSTForClosedConnection();
 
   std::string TcpStateStr(TCP_STATE state);
 
@@ -141,18 +146,17 @@ class TcpController {
 
   Executors::FixedThreadPool thread_pool_;
 
-  // ************** Receive Pipeline ************** //
+  // *************************** Receive Pipeline *************************** //
   // Packet receive buffer. This is the low-level queue to buffer received
   // packets delivered from host (namely layer 2).
   PacketQueue pkt_recv_buffer_;
 
-  // Recv window. No mutex needed. Only PacketReceiveBufferListner thread
-  // use it.
+  // Recv window. No mutex is needed. Only PacketReceiveBufferListner thread
+  // could modify it.
   RecvWindow recv_window_;
-  std::atomic_bool fin_received_;
-  std::atomic_uint fin_seq_;
 
-  // Socket receive buffer.
+  // Socket receive buffer. Note pipe_state_ is also protected by its mutex,
+  // since we use it to indicate receive buffer has received EOF.
   Utility::RingBuffer recv_buffer_;
   std::mutex recv_buffer_mutex_;
   std::condition_variable recv_buffer_read_cv_;
@@ -160,10 +164,10 @@ class TcpController {
 
   enum PipeState {
     OPEN,
-    EOF_READ,
-    EOF_NOT_READ,
+    EOF_NOT_CONSUMED,
+    EOF_CONSUMED,
   };
-  std::atomic<PipeState> pipe_state_;
+  PipeState pipe_state_;
 
   // This is a temporary queue to store overflowed packets when socket receive
   // buffer is full. This is for a corner case of flow control. When receive
@@ -171,13 +175,12 @@ class TcpController {
   std::queue<std::shared_ptr<Packet>> overflow_pkts_;
   std::mutex overflow_pkts_mutex_;
 
-  // *************** Send Pipeline **************** //
+  // *************************** Send Pipeline ****************************** //
   // Socket send buffer.
   Utility::RingBuffer send_buffer_;
   std::mutex send_buffer_mutex_;
   std::condition_variable send_buffer_data_cv_;  // send buffer has data
   std::condition_variable send_buffer_write_cv_; // send buffer has space
-  std::condition_variable send_buffer_empty_cv_; // send buffer is empty
 
   // Send window.
   SendWindow send_window_;
@@ -188,13 +191,17 @@ class TcpController {
   // to host (namely layer 2).
   PacketQueue pkt_send_buffer_;
 
+  // ***************************** Timers *********************************** //
   // This is the TCP sliding window timer.
   Utility::Timer timer_;
 
   // Other timers which we use in connection management.
   Utility::Timer syn_timer_;
   Utility::Timer fin_timer_;
+  Utility::Timer close_timer_;
 
+
+  // **************************** TCP state ********************************* //
   // TCP state.
   TCP_STATE state_ = CLOSED;
   std::mutex state_mutex_;

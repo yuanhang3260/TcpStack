@@ -12,7 +12,7 @@ namespace net_stack {
 
 namespace {
 
-uint32 kThreadPoolSize = 6;
+uint32 kThreadPoolSize = 9;
 
 uint32 kDefaultDataPacketSize = 10;
 uint32 kInitialSSThresh = 8 * kDefaultDataPacketSize;
@@ -49,10 +49,11 @@ TcpController::TcpController(Host* host,
     syn_timer_(std::chrono::seconds(10),
            std::bind(&TcpController::CloseAndDelete, this)),
     fin_timer_(std::chrono::seconds(30),
+           std::bind(&TcpController::CloseAndDelete, this)),
+    close_timer_(std::chrono::seconds(30),
            std::bind(&TcpController::CloseAndDelete, this)) {
   state_ = CLOSED;
-  fin_received_.store(false);
-  pipe_state_.store(OPEN);
+  pipe_state_ = OPEN;
 
   // Init timeout is 500ms.
   estimated_rtt_ = timeout_interval_ = kInitialTimeout;
@@ -64,13 +65,15 @@ TcpController::TcpController(Host* host,
   timer_.SetRepeat(true);
 
   thread_pool_.AddTask(
-      std::bind(&TcpController::PacketReceiveBufferListner, this));
-  thread_pool_.AddTask(
-      std::bind(&TcpController::SocketSendBufferListener, this));
+      std::bind(&TcpController::PacketReceiveBufferListener, this));
   thread_pool_.AddTask(
       std::bind(&TcpController::PacketSendBufferListener, this));
-  // thread_pool_.AddTask(
-  //     std::bind(&TcpController::SocketReceiveBufferListener, this));
+
+  thread_pool_.AddTask(
+      std::bind(&TcpController::SendBufferListener, this));
+  thread_pool_.AddTask(
+      std::bind(&TcpController::ReceiveBufferListener, this));
+
   thread_pool_.Start();
 }
 
@@ -96,8 +99,14 @@ void TcpController::TearDown() {
   pkt_recv_buffer_.Stop();
   pkt_send_buffer_.Stop();
 
+  DetachSocket();
+
   thread_pool_.Stop();
   thread_pool_.AwaitTermination();
+}
+
+void TcpController::DetachSocket() {
+  socket_->tcp_con = nullptr;
 }
 
 bool TcpController::TryConnect() {
@@ -142,25 +151,72 @@ bool TcpController::TryShutDown() {
   {
     std::unique_lock<std::mutex> state_lock(state_mutex_);
     // The connection is already into closing states.
-    if (state_ == LAST_ACK || state_ == CLOSED) {
+    if (InClosingState()) {
       return true;
     }
   }
 
-  // Send FIN segment. It waits for socket send buffer to be cleared and then
-  // enqueue the FIN segment.
+  // Send FIN segment. From now on there should be no more data to send. The
+  // TCP will transit to FIN_WAIT_1 or LAST_ACK, and InClosingState will return
+  // true.
   SendFIN();
   return true;
 }
 
+bool TcpController::TryClose() {
+  TryShutDown();
+
+  // TCP connection is closed on this side, and no more data is allowed to be
+  // received. From now if receive buffer is or becomes non-empty, send back an
+  // RST immediately. We implement it by starting a separate thread, which
+  // listens to receive buffer and does fake read. It simulates Read() sys call
+  // listens app, but just performs at TCP layer. There will be no race on
+  // receive buffer, since the socket has been closed and there will be no user
+  // thread being able to access this TCP connection.
+  CloseConnection();
+
+  // Note the graceful way of TCP disconncting is still working. If the other
+  // side continue to send data packets, SendRSTForClosedConnection will send
+  // RST back. If the other side received RST, fin_timer will finally timeout
+  // and clean up this connection.
+  return true;
+}
+
+void TcpController::CloseConnection() {
+  thread_pool_.AddTask(
+      std::bind(&TcpController::SendRSTForClosedConnection, this));
+}
+
+void TcpController::SendRSTForClosedConnection() {
+  while (!shutdown_.load()) {
+    {
+      std::unique_lock<std::mutex> lock(recv_buffer_mutex_);
+      recv_buffer_read_cv_.wait(lock, [this] { return !recv_buffer_.empty(); });
+
+      if (shutdown_.load()) {
+        break;
+      }
+    }
+
+    // Set TCP state to closed. Now graceful disconnection is disabled. This
+    // connection will finally be cleaned up by fin_timer or close_timer.
+    {
+      std::unique_lock<std::mutex> state_lock(state_mutex_);
+      state_ = CLOSED;
+    }
+    close_timer_.Restart();
+
+    // Receive buffer is not empty after connection has been closed, send RST
+    // immediately.
+    SendPacket(std::move(MakeRstPacket()));
+    // std::queue<std::unique_ptr<Packet>> packets_to_send;
+    // packets_to_send.push(std::move(MakeRstPacket()));
+    // host_->MultiplexPacketsFromTcp(&packets_to_send);
+  }
+}
+
 void TcpController::SendFIN() {
   debuginfo("Sending FIN...");
-  // Sending FIN needs to wait for socket send buffer to become empty.
-  {
-    std::unique_lock<std::mutex> lock_send_window(send_buffer_mutex_);
-    send_buffer_empty_cv_.wait(lock_send_window,
-        [this] { return send_buffer_.empty(); });
-  }
 
   // Send FIN and transit TCP state.
   std::shared_ptr<Packet> fin_pkt;
@@ -183,19 +239,21 @@ void TcpController::SendFIN() {
       return;
     }
   }
+
+  // Actually send FIN packet.
   SendPacket(std::unique_ptr<Packet>(fin_pkt->Copy()));
   timer_.Restart(CurrentTimeOut());
   fin_timer_.Restart();
 }
 
 // This method just enqueue the new packets into this TCP connection's private
-// packet receive buffer. It is PacketReceiveBufferListner that monitors this
+// packet receive buffer. It is PacketReceiveBufferListener that monitors this
 // queue and handles packets.
 void TcpController::ReceiveNewPacket(std::unique_ptr<Packet> packet) {
   pkt_recv_buffer_.Push(std::move(packet));
 }
 
-void TcpController::PacketReceiveBufferListner() {
+void TcpController::PacketReceiveBufferListener() {
   while (!shutdown_.load()) {
     // Get all new packets.
     std::queue<std::unique_ptr<Packet>> new_packets;
@@ -205,48 +263,6 @@ void TcpController::PacketReceiveBufferListner() {
     SANITY_CHECK(new_packets.empty(),
                  "New packets queue should have been cleared");
   }
-}
-
-bool TcpController::HandleDataPacket(std::unique_ptr<Packet> pkt) {
-  // If this is a zero-size data packet, sender is probing receive window
-  // size.
-  if (pkt->payload_size() == 0) {
-    SendPacket(std::move(MakeAckPacket(recv_window_.recv_base())));
-    return true;
-  }
-
-  // If already received FIN, there should be no more data packets after FIN.
-  if (fin_received_.load() && pkt->tcp_header().seq_num > fin_seq_) {
-    // Ack FIN ?
-    return true;
-  }
-
-  // FIN already sent, and socket is closed. If new data is received, send RST
-  // immediately to the other side.
-  bool closing = false;
-  {
-    std::unique_lock<std::mutex> state_lock(state_mutex_);
-    closing = InClosingState();
-  }
-  if (closing &&
-      pkt->tcp_header().seq_num > recv_window_.recv_base() &&
-      socket_->state == Socket::CLOSED) {
-    // Directly hand this packet to host to send out, rather than pushing it
-    // to packet send buffer, to make sure this packet is sent out.
-    std::queue<std::unique_ptr<Packet>> packets_to_send;
-    packets_to_send.push(std::move(MakeRstPacket()));
-    host_->MultiplexPacketsFromTcp(&packets_to_send);
-    CloseAndDelete();
-    return true;
-  }
-
-  // Handle data packet. Deliver packets to upper layer (socket receive
-  // buffer) if avaible, and sends ack packet back to sender.
-  auto pair = recv_window_.ReceivePacket(std::move(pkt));
-  StreamDataToReceiveBuffer(pair.second);
-
-  SendPacket(std::move(MakeAckPacket(pair.first)));
-  return true;
 }
 
 void TcpController::HandleReceivedPackets(
@@ -274,6 +290,23 @@ void TcpController::HandleReceivedPackets(
 bool TcpController::HandleRst() {
   // Handle RST is easy - Just terminate this TCP connection.
   CloseAndDelete();
+  return true;
+}
+
+bool TcpController::HandleDataPacket(std::unique_ptr<Packet> pkt) {
+  // If this is a zero-size data packet, sender is probing receive window
+  // size.
+  if (pkt->payload_size() == 0) {
+    SendPacket(std::move(MakeAckPacket(recv_window_.recv_base())));
+    return true;
+  }
+
+  // Handle data packet. Deliver packets to upper layer (socket receive
+  // buffer) if avaible, and sends ack packet back to sender.
+  auto pair = recv_window_.ReceivePacket(std::move(pkt));
+  StreamDataToReceiveBuffer(pair.second);
+
+  SendPacket(std::move(MakeAckPacket(pair.first)));
   return true;
 }
 
@@ -384,11 +417,9 @@ bool TcpController::HandleACKSYN(std::unique_ptr<Packet> pkt) {
 }
 
 bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
-  // FIN segment. Ack this segment, and transit TCP state.
-
-  // If TCP is in state FIN_WAIT_1, it's waiting for ACK_FIN from the other
-  // side. Since it's not in FIN_WAIT_2 state yet, it can't accept a FIN. Just
-  // drop this segment.
+  // TODO: If TCP is in state FIN_WAIT_1, it's waiting for ACK_FIN from the
+  // other side. Since it's not in FIN_WAIT_2 state yet, it can't accept a FIN.
+  // Just drop this segment. This also can happen when both sides initiate FIN.
   {
     std::unique_lock<std::mutex> state_lock(state_mutex_);
     if (state_ == FIN_WAIT_1) {
@@ -396,28 +427,18 @@ bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
     }
   }
 
-  // Deliver this FIN packet to upper level to notify blocking Read().
-  uint32 seq_num = pkt->tcp_header().seq_num;
-  auto pair = recv_window_.ReceivePacket(std::move(pkt));
-  StreamDataToReceiveBuffer(pair.second);
-
-  // Ack this FIN, and transit TCP state.
-  fin_seq_.store(seq_num);
-  fin_received_.store(true);
+  // Transit TCP state first. This should be done before delivering this FIN
+  // to receive window. Otherwise upper level may get EOF first and call a
+  // Close() before TCP transits to CLOST_WAIT state. In this case we'll have
+  // both side in FIN_WAIT_1 state.
   std::unique_lock<std::mutex> state_lock(state_mutex_);
   if (state_ == ESTABLISHED) {
-    // CLOSE_WAIT state waits for socket send buffer to become empty, and
-    // then send FIN back to the other side.
+    // CLOSE_WAIT state waits for app to call Close() or ShutDown() to send FIN
+    // back to the other side.
     debuginfo("Got FIN 1");
-    // If receive window is cleared (last packet is FIN_1), we can transit
-    // to CLOSE_WAIT state.
-    debuginfo("into CLOSE_WAIT");
     SANITY_CHECK(recv_window_.empty(),
         "Receive window should be empty after FIN has been processed");
     state_ = CLOSE_WAIT;
-    // Notify blocking Read() to return 0.
-    pipe_state_.store(EOF_NOT_READ);
-    recv_buffer_read_cv_.notify_one();
   } else if (state_ == FIN_WAIT_2) {
     debuginfo("Got FIN 2");
     state_ = TIME_WAIT;
@@ -432,7 +453,13 @@ bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
   }
   state_lock.unlock();
 
-  // Do ack. It may be acking this FIN, or still acking existing data packets.
+  // Deliver this FIN packet to receive window, and maybe it will stream data
+  // to receive buffer as EOF.
+  auto pair = recv_window_.ReceivePacket(std::move(pkt));
+  StreamDataToReceiveBuffer(pair.second);
+
+  // Do ack. Note it may be acking this FIN, or still acking previous data
+  // packets, depending on the state of receive window.
   SendPacket(std::move(MakeAckPacket(pair.first)));
   return true;
 }
@@ -541,7 +568,7 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
 
   // Update RTT.
   if (ack_re.ack_refreshed && ack_re.rtt.count() > 0) {
-    UpdateRTT(ack_re.rtt);
+    //UpdateRTT(ack_re.rtt);
   }
 
   // If send window is cleared, stop the timer.
@@ -552,7 +579,7 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
   }
 
   // Update congestion control state.
-  UpdateCongestionControl(ack_re);
+  //UpdateCongestionControl(ack_re);
 
   // Flow control - set send window size as receiver indicated.
   uint32 new_send_window_capacity =
@@ -578,14 +605,17 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
     debuginfo("Server --> Client connection established ^_^");
     state_cv_.notify_one();
   } else if (state_ == FIN_WAIT_1 && send_window_empty) {
-    // Received ACK for FIN_WAIT_1, transit to FIN_WAIT_2. Note that we must
-    // check if send window is cleared, with last packet (FIN) been acked.
+    // Note this ACK may not be acking the FIN we previously sent. It might
+    // just be a regular data packet ACK. So we must check send window is
+    // already cleared, since there's no packet in send window after FIN packet.
+    // In this way we know for sure this ACK is the FIN ACK we are expecting.
     debuginfo("Got ACK for FIN 1");
     state_ = FIN_WAIT_2;
     fin_timer_.Stop();
   } else if (state_ == LAST_ACK && send_window_empty) {
     debuginfo("Got LAST_ACK");
-    // Received last ack. This TCP connection can finally be closed.
+    // Same as above, need to check send_window_empty. If received last ack,
+    // this TCP connection can finally be closed.
     state_ = CLOSED;
     fin_timer_.Stop();
     CloseAndDelete();
@@ -616,6 +646,7 @@ void TcpController::StreamDataToReceiveBuffer(
 
       if (pkt->tcp_header().fin) {
         // FIN receivd. No more data should be delivered to upper layer.
+        pipe_state_ = EOF_NOT_CONSUMED;
         break;
       }
 
@@ -623,10 +654,8 @@ void TcpController::StreamDataToReceiveBuffer(
         uint32 writen =
             recv_buffer_.Write(pkt->payload(), pkt->payload_size());
         if (writen <= 0) {
-          LogFATAL("Socket receive buffer is full, pkt seq = %u is dropped.",
+          LogERROR("Socket receive buffer is full, pkt seq = %u is overflowd.",
                    pkt->tcp_header().seq_num);
-          // LogFATAL("hehe");
-
           overflow_pkts_.push(pkt);
         }
       } else {
@@ -638,8 +667,8 @@ void TcpController::StreamDataToReceiveBuffer(
   recv_buffer_read_cv_.notify_one();
 }
 
-void TcpController::SocketReceiveBufferListener() {
-  while (true) {
+void TcpController::ReceiveBufferListener() {
+  while (!shutdown_.load()) {
     {
       std::unique_lock<std::mutex> lock(recv_buffer_mutex_);
       recv_buffer_write_cv_.wait(lock,
@@ -653,6 +682,8 @@ void TcpController::SocketReceiveBufferListener() {
 }
 
 void TcpController::PushOverflowedPacketsToSocketBuffer() {
+  // Don't lock recv_buffer_mutex! It's already locked in
+  // ReceiveBufferListener.
   uint32 overflowed_pkts_size = overflow_pkts_.size();
   for (uint32 i = 0; i < overflowed_pkts_size; i++) {
     auto pkt = overflow_pkts_.front().get();
@@ -672,39 +703,29 @@ void TcpController::PushOverflowedPacketsToSocketBuffer() {
 
 // TODO: add support for non-blocking read.
 int32 TcpController::ReadData(byte* buf, int32 size) {
-  // {
-  //   std::unique_lock<std::mutex> lock(state_mutex_);
-  //   if (state_ != ESTABLISHED) {
-  //     LogERROR("TCP connection not established, abort ReadData");
-  //     return -1;
-  //   }
-  // }
-
-  if (pipe_state_.load() == EOF_READ) {
-    LogERROR("Broken pipe");
-    return -1;
+  if (pipe_state_ == EOF_CONSUMED) {
+    LogFATAL("There should be no data after EOF.");
   }
 
   std::unique_lock<std::mutex> lock(recv_buffer_mutex_);
   recv_buffer_read_cv_.wait(lock,
-      [this] { return pipe_state_.load() == EOF_NOT_READ ||
+      [this] { return pipe_state_ == EOF_NOT_CONSUMED ||
                       !recv_buffer_.empty(); });
 
-  // Socket is closed by the other side.
-  if (pipe_state_.load() == EOF_NOT_READ && recv_buffer_.empty()) {
-    pipe_state_.store(EOF_READ);
+  // EOF is received, and all data in receive buffer has been read by app,
+  // Read() sys call now can return zero.
+  if (pipe_state_ == EOF_NOT_CONSUMED && recv_buffer_.empty()) {
+    pipe_state_ = EOF_CONSUMED;
     return 0;
   }
 
-  // Copy data to user buffer.
-  // TODO: replace with RingBuffer to check flow control.
+  // There is still data in receive buffer. Deliver it to user buffer.
   uint32 readn = recv_buffer_.Read(buf, size);
 
   if (readn > 0) {
     recv_buffer_write_cv_.notify_one();
   }
 
-  // Cast should be safe. We'll never have a receive buffer as big as 2^31
   return static_cast<int32>(readn);
 }
 
@@ -729,7 +750,7 @@ int32 TcpController::WriteData(const byte* buf, int32 size) {
   return static_cast<int32>(writen);
 }
 
-void TcpController::SocketSendBufferListener() {
+void TcpController::SendBufferListener() {
   // Wait for TCP connection to be established.
   //
   // Specifically, this is for client to wait in SYN_SENT state , and for
@@ -988,6 +1009,7 @@ bool TcpController::InClosingState() {
   // These are state after either side sends FIN.
   //
   // Note CLOSE_WAIT state is not included. It still allows sending data.
+  // A closing state could only be triggered by SendFIN.
   return state_ == FIN_WAIT_1 || state_ == FIN_WAIT_2 || state_ == TIME_WAIT ||
          state_ == LAST_ACK;
 }
