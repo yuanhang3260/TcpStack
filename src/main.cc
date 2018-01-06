@@ -1,9 +1,12 @@
 #include "Base/Log.h"
 #include "Base/Utils.h"
+
 #include "BaseChannel.h"
 #include "Host.h"
 #include "TcpController.h"
 #include "Utility/ThreadPool.h"
+
+namespace {
 
 using Executors::FixedThreadPool;
 using net_stack::BaseChannel;
@@ -11,16 +14,13 @@ using net_stack::Host;
 using net_stack::Process;
 using std::placeholders::_1;
 
-namespace {
-
 const char* const kAliceIP = "127.0.0.1";
 const char* const kBobIP = "127.0.0.2";
 const uint32 kAlicePort = 10;
 const uint32 kBobPort = 20;
-const uint32 kAliceSocket = 5;
-const uint32 kBobSocket = 5;
 
-const uint32 kTestDataSize = 10;
+const uint32 kTestDataSize = 100;
+
 byte* data;
 byte* receive_buffer;
 
@@ -45,22 +45,21 @@ bool ReceivedDataCorrect() {
 
 void Client(Process* process) {
   // Create client socket.
-  int sock_fd = process->Socket();
-  if (sock_fd < 0) {
+  int fd = process->Socket();
+  if (fd < 0) {
     LogERROR("Failed to create client socket");
     return;
   }
 
   // Bind to static port.
-  bool re = process->Bind(sock_fd, kAliceIP, kAlicePort);
+  bool re = process->Bind(fd, kAliceIP, kAlicePort);
   if (!re) {
-    LogERROR("Failed to bind socket %d to {%s, %u}",
-             sock_fd, kAliceIP, kAlicePort);
+    LogERROR("Failed to bind socket %d to %s:%u", fd, kAliceIP, kAlicePort);
     return;
   }
 
   // Connect server.
-  re = process->Connect(sock_fd, kBobIP, kBobPort);
+  re = process->Connect(fd, kBobIP, kBobPort);
   if (!re) {
     LogERROR("Client Alice failed to connect to server Bob");
     return;
@@ -69,9 +68,11 @@ void Client(Process* process) {
   // Begin sending data to server.
   uint32 writen = 0;
   while (writen < kTestDataSize) {
-    auto re = process->Write(sock_fd, data + writen, kTestDataSize - writen);
+    auto re = process->Write(fd, data + writen, kTestDataSize - writen);
     if (re > 0) {
       writen += re;
+    } else {
+      break;
     }
   }
   if (writen != kTestDataSize) {
@@ -82,15 +83,19 @@ void Client(Process* process) {
   uint32 readn = 0;
   byte client_buffer[kTestDataSize];
   while (readn < kTestDataSize) {
-    auto re = process->Read(sock_fd, client_buffer + readn, kTestDataSize);
+    auto re = process->Read(fd, client_buffer + readn, kTestDataSize);
     if (re > 0) {
       readn += re;
+    } else {
+      break;
     }
   }
   if (readn != kTestDataSize) {
-    LogERROR("Alice received %d bytes data\n", readn);
+    LogERROR("Alice received %d bytes data", readn);
+    process->Close(fd);
     return;
   }
+
   bool flip_correct = true;
   for (uint32 i = 0; i < kTestDataSize; i++) {
     if (client_buffer[i] != 256 - data[i]) {
@@ -100,10 +105,10 @@ void Client(Process* process) {
     }
   }
   if (flip_correct) {
-    printf("Alice received correct data \033[2;32m:)\033[0m\n");
+    LogINFO("Alice received correct data \033[2;32m:)\033[0m");
   }
 
-  process->Close(sock_fd);
+  process->Close(fd);
 }
 
 void Server(Process* process) {
@@ -137,11 +142,8 @@ void Server(Process* process) {
       LogERROR("Accept failed");
       continue;
     }
-    break;
-  }
-
-  // Server handle request.
-  while(true) {
+    
+    // Server handle request.
     uint32 readn = 0;
     while (readn < kTestDataSize) {
       auto re = process->Read(tcp_socket, receive_buffer + readn,
@@ -149,21 +151,24 @@ void Server(Process* process) {
       if (re > 0) {
         readn += re;
       }
-      if (re == 0) {
+      else if (re == 0) {
         LogINFO("Client closed socket, server now closing...");
         process->Close(tcp_socket);
         return;
+      } else {
+        break;
       }
       //printf("readn = %d\n", readn);
     }
     if (readn != kTestDataSize) {
       LogERROR("Bob received %d bytes data\n", readn);
+      process->Close(tcp_socket);
       return;
     }
     if (!ReceivedDataCorrect()) {
       LogERROR("Receive data failed");
     } else {
-      printf("Bob received correct data \033[2;32m:)\033[0m\n");
+      LogINFO("Bob received correct data \033[2;32m:)\033[0m");
     }
 
     // Service: Flip each byte and send back to client.
@@ -182,6 +187,7 @@ void Server(Process* process) {
     if (writen != kTestDataSize) {
       LogERROR("Bob sent %d bytes data\n", writen);
     }
+    process->Close(tcp_socket);
   }
 }
 

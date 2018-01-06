@@ -52,6 +52,8 @@ class Process {
  private:
   int32 FindFdMappedFileId(int32 fd);
 
+  void ReleaseResource();
+
   // Kernel ref.
   Host* host_;
   std::string name_;
@@ -105,7 +107,6 @@ class Host {
   int32 WriteData(int32 open_file_id, const byte* buffer, int32 size);
 
   bool ShutDownSocket(int32 open_file_id);
-  bool CloseSocket(int32 open_file_id);
 
   std::string hostname() const { return hostname_; }
   std::string ip_address() const { return local_ip_address_; }

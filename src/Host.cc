@@ -1,12 +1,17 @@
+#include "Strings/Utils.h"
+#include "Utility/CleanUp.h"
+
+
 #include "Base/Ptr.h"
 #include "Base/Log.h"
 #include "Base/Utils.h"
 #include "Host.h"
-#include "Utility/CleanUp.h"
 
 namespace net_stack {
 
 namespace {
+
+using Strings::StrCat;
 
 // Process file descriptor available in [3, 64).
 const int32 kMinFd = 3;
@@ -16,9 +21,9 @@ const int32 kMaxFd = 63;
 const int32 kMinOpenFileId = 0;
 const int32 kMaxOpenFileId = 255;
 
-// Port available in [1024, 1024 + 128).
-const int32 kMinPort = 1024;
-const int32 kMaxPort = 1151;
+// Port available in [0, 128).
+const int32 kMinPort = 0;
+const int32 kMaxPort = 127;
 
 }  // namespace
 
@@ -34,6 +39,20 @@ Process::Process(Host* host, const std::string& name, Program program) :
 
 void Process::Run() {
   program_(this);
+  ReleaseResource();
+}
+
+void Process::ReleaseResource() {
+  // Close all file descriptors. Note we first save all fds locally, because
+  // Close() will delete fd entry from fd_table.
+  std::vector<int32> fds;
+  for (const auto& it : fd_table_) {
+    fds.push_back(it.first);
+  }
+  for (int32 fd : fds) {
+    host_->debuginfo(StrCat("closing fd ", std::to_string(fd)));
+    Close(fd);
+  }
 }
 
 Process::~Process() {}
@@ -43,7 +62,8 @@ int32 Process::FindFdMappedFileId(int32 fd) {
   std::unique_lock<std::mutex> lock(fd_table_mutex_);
   auto it = fd_table_.find(fd);
   if (it == fd_table_.end()) {
-    LogERROR("Invalid fd %d, not allocated. Is it closed?");
+    host_->debuginfo(StrCat("Invalid fd ", std::to_string(fd),
+                            ", not allocated / or maybe closed?"));
     return -1;
   }
   int32 open_file_id = it->second;
@@ -51,6 +71,7 @@ int32 Process::FindFdMappedFileId(int32 fd) {
 }
 
 int32 Process::Socket() {
+  host_->debuginfo("Socket()");
   // Allocate a new file descriptor.
   int32 fd = fd_pool_->Allocate();
   if (fd < 0) {
@@ -71,6 +92,7 @@ int32 Process::Socket() {
 
 bool Process::Bind(int32 socket_fd,
                    const std::string& local_ip, uint32 local_port) {
+  host_->debuginfo("Bind()");
   int32 open_file_id = FindFdMappedFileId(socket_fd);
   if (open_file_id < 0) {
     return false;
@@ -79,6 +101,7 @@ bool Process::Bind(int32 socket_fd,
 }
 
 bool Process::Listen(int32 socket_fd) {
+  host_->debuginfo("Listen()");
   int32 open_file_id = FindFdMappedFileId(socket_fd);
   if (open_file_id < 0) {
     return false;
@@ -87,6 +110,7 @@ bool Process::Listen(int32 socket_fd) {
 }
 
 int Process::Accept(int32 socket_fd) {
+  host_->debuginfo("Accept()");
   int32 open_file_id = FindFdMappedFileId(socket_fd);
   if (open_file_id < 0) {
     return false;
@@ -116,6 +140,7 @@ int Process::Accept(int32 socket_fd) {
 
 bool Process::Connect(int32 socket_fd,
                       const std::string& remote_ip, uint32 remote_port) {
+  host_->debuginfo("Connect()");
   int32 open_file_id = FindFdMappedFileId(socket_fd);
   if (open_file_id < 0) {
     return false;
@@ -125,14 +150,17 @@ bool Process::Connect(int32 socket_fd,
 }
 
 int32 Process::Read(int32 fd, byte* buffer, int32 size) {
+  host_->debuginfo("Read()");
   int32 open_file_id = FindFdMappedFileId(fd);
   if (open_file_id < 0) {
+    // Bad file descriptor error. It's closed and not mapped to any file/socket.
     return false;
   }
   return host_->ReadData(open_file_id, buffer, size);
 }
 
 int32 Process::Write(int32 fd, const byte* buffer, int32 size) {
+  host_->debuginfo("Write()");
   int32 open_file_id = FindFdMappedFileId(fd);
   if (open_file_id < 0) {
     return false;
@@ -141,6 +169,7 @@ int32 Process::Write(int32 fd, const byte* buffer, int32 size) {
 }
 
 bool Process::ShutDown(int32 fd) {
+  host_->debuginfo("Shutdown()");
   int32 open_file_id = FindFdMappedFileId(fd);
   if (open_file_id < 0) {
     return false;
@@ -149,6 +178,7 @@ bool Process::ShutDown(int32 fd) {
 }
 
 bool Process::Close(int32 fd) {
+  host_->debuginfo("Close()");
   // Close() is different from ShutDown(). Close() just closes the process
   // file descriptor that maps to the open file entry of this socket. It will
   // decrease the open file reference count. When reference count becomes zero,
@@ -160,12 +190,11 @@ bool Process::Close(int32 fd) {
     return false;
   }
 
-  int refs = host_->DecOpenFileRef(open_file_id);
-  if (refs == 0) {
-    host_->ShutDownSocket(open_file_id);
-  }
+  // This will decrease socket ref count in open file table, and if ref count
+  // is zero, will close TCP connection and delete open file table entry. 
+  host_->DecOpenFileRef(open_file_id);
 
-  // Release file descriptor in this process.
+  // Remove fd from fd_table and release the file descriptor.
   {
     std::unique_lock<std::mutex> lock(fd_table_mutex_);
     auto it = fd_table_.find(fd);
@@ -260,7 +289,20 @@ int32 Host::DecOpenFileRef(int32 open_file_id) {
   }
 
   if (it->second->Refs() <= 1) {
-    it->second->socket.Reset();
+    Socket* socket = &it->second->socket;
+
+    // Ref count is zero, close the TCP connection. Closing is bi-directional.
+    // A closed socket will never be able to receive data any more. So the
+    // mapped TCP connection should be notified of that fact. From now on,
+    // if this TCP connection's receive buffer is or becomes non-empty, TCP
+    // connection should send RST immediately to the other side to indicate a
+    // closed connection. These are all implemented in TcpController::TryClose.
+    if (socket->tcp_con != nullptr) {
+      TcpController* tcp_con = socket->tcp_con;
+      tcp_con->TryClose();
+    }
+
+    // Delete socket from open file table.
     open_files_table_.erase(it);
     return 0;
   } else {
@@ -309,7 +351,7 @@ bool Host::SocketBind(int32 open_file_id,
   }
 
   if (!port_pool_->Take(local_port)) {
-    LogERROR("Could not bind to local_port %d which is already being used.");
+    LogERROR("local_port %d is already being used.", local_port);
     return false;
   }
 
@@ -589,6 +631,10 @@ bool Host::ShutDownSocket(int32 open_file_id) {
   if (socket == nullptr) {
     return -1;
   }
+  if (socket->state == Socket::SHUTDOWN) {
+    return true;
+  }
+
   TcpController* tcp_con = socket->tcp_con;
   socket->state = Socket::SHUTDOWN;
 
@@ -598,29 +644,6 @@ bool Host::ShutDownSocket(int32 open_file_id) {
   auto re = tcp_con->TryShutDown();
   if (!re) {
     // TODO: Shutdown fail?
-    return false;
-  }
-
-  return true;
-}
-
-bool Host::CloseSocket(int32 open_file_id) {
-  // CloseSocket is very similar to ShutDownSocket, but just has one more step.
-  // Closing is bi-directional. A closed socket will never be able to receive
-  // data any more. So the mapped TCP connection should be notified of that
-  // fact. From now on, if this TCP connection's receive buffer is or becomes
-  // non-empty, TCP connection should send RST immediately to the other side
-  // to indicate a closed connection.
-  Socket* socket = GetSocket(open_file_id);
-  if (socket == nullptr) {
-    return -1;
-  }
-  TcpController* tcp_con = socket->tcp_con;
-  socket->state = Socket::SHUTDOWN;
-
-  // Note we call TcpController::TryClose, rather than TryShutDown.
-  auto re = tcp_con->TryClose();
-  if (!re) {
     return false;
   }
 

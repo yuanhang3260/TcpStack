@@ -1,6 +1,7 @@
 #include <chrono>
 #include <climits>
 #include <cstdlib>
+#include <unistd.h>
 
 #include "Base/Log.h"
 #include "Base/MacroUtils.h"
@@ -46,7 +47,7 @@ TcpController::TcpController(Host* host,
     send_window_(options.send_window_base, options.send_window_size),
     timer_(std::chrono::milliseconds(5 * 100),
            std::bind(&TcpController::TimeoutReTransmitter, this)),
-    syn_timer_(std::chrono::seconds(10),
+    syn_timer_(std::chrono::seconds(2),
            std::bind(&TcpController::CloseAndDelete, this)),
     fin_timer_(std::chrono::seconds(30),
            std::bind(&TcpController::CloseAndDelete, this)),
@@ -94,7 +95,9 @@ void TcpController::TearDown() {
 
   state_cv_.notify_all();
   send_window_cv_.notify_all();
-  send_buffer_data_cv_.notify_all();
+  send_buffer_read_cv_.notify_all();
+  send_buffer_write_cv_.notify_all();
+  recv_buffer_read_cv_.notify_all();
 
   pkt_recv_buffer_.Stop();
   pkt_send_buffer_.Stop();
@@ -103,6 +106,8 @@ void TcpController::TearDown() {
 
   thread_pool_.Stop();
   thread_pool_.AwaitTermination();
+
+  usleep(500);
 }
 
 void TcpController::DetachSocket() {
@@ -183,6 +188,10 @@ bool TcpController::TryClose() {
 }
 
 void TcpController::CloseConnection() {
+  // Wake up all blocking Read() on this conneciton. They should return -1.
+  // Ideally there should not be multi-thread reading the same socket.
+  recv_buffer_read_cv_.notify_all();
+
   thread_pool_.AddTask(
       std::bind(&TcpController::SendRSTForClosedConnection, this));
 }
@@ -191,11 +200,14 @@ void TcpController::SendRSTForClosedConnection() {
   while (!shutdown_.load()) {
     {
       std::unique_lock<std::mutex> lock(recv_buffer_mutex_);
-      recv_buffer_read_cv_.wait(lock, [this] { return !recv_buffer_.empty(); });
+      recv_buffer_read_cv_.wait(lock, [this] {
+        return shutdown_.load() || !recv_buffer_.empty();
+      });
 
       if (shutdown_.load()) {
         break;
       }
+      recv_buffer_.Clear();
     }
 
     // Set TCP state to closed. Now graceful disconnection is disabled. This
@@ -216,6 +228,10 @@ void TcpController::SendRSTForClosedConnection() {
 }
 
 void TcpController::SendFIN() {
+  if (shutdown_.load()) {
+    return;
+  }
+
   debuginfo("Sending FIN...");
 
   // Send FIN and transit TCP state.
@@ -417,16 +433,6 @@ bool TcpController::HandleACKSYN(std::unique_ptr<Packet> pkt) {
 }
 
 bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
-  // TODO: If TCP is in state FIN_WAIT_1, it's waiting for ACK_FIN from the
-  // other side. Since it's not in FIN_WAIT_2 state yet, it can't accept a FIN.
-  // Just drop this segment. This also can happen when both sides initiate FIN.
-  {
-    std::unique_lock<std::mutex> state_lock(state_mutex_);
-    if (state_ == FIN_WAIT_1) {
-      return true;
-    }
-  }
-
   // Transit TCP state first. This should be done before delivering this FIN
   // to receive window. Otherwise upper level may get EOF first and call a
   // Close() before TCP transits to CLOST_WAIT state. In this case we'll have
@@ -436,8 +442,6 @@ bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
     // CLOSE_WAIT state waits for app to call Close() or ShutDown() to send FIN
     // back to the other side.
     debuginfo("Got FIN 1");
-    SANITY_CHECK(recv_window_.empty(),
-        "Receive window should be empty after FIN has been processed");
     state_ = CLOSE_WAIT;
   } else if (state_ == FIN_WAIT_2) {
     debuginfo("Got FIN 2");
@@ -446,10 +450,14 @@ bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
     // Wait for 2 * MSL (typically it should last 1 ~ 2 minutes), and terminate
     // this TCP connection.
     std::thread kill([&] {
-      std::this_thread::sleep_for(std::chrono::seconds(10));
+      std::this_thread::sleep_for(std::chrono::seconds(3));
       CloseAndDelete();
     });
     kill.detach();
+  } else if (state_ == FIN_WAIT_1) {
+    // This is simultaneous close case. TCP state should transit to CLOSING.
+    debuginfo("Got FIN 1, simultaneous close");
+    state_ = CLOSING;
   }
   state_lock.unlock();
 
@@ -478,6 +486,7 @@ void TcpController::CloseAndDelete() {
     std::unique_lock<std::mutex> lock(destroy_mutex_);
     destroy_ = true;
     destroy_cv_.notify_one();
+    debuginfo("destroy");
   });
   shut_down.detach();
 
@@ -619,6 +628,16 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
     state_ = CLOSED;
     fin_timer_.Stop();
     CloseAndDelete();
+  } else if (state_ == CLOSING) {
+    state_ = TIME_WAIT;
+
+    // Wait for 2 * MSL (typically it should last 1 ~ 2 minutes), and terminate
+    // this TCP connection.
+    std::thread kill([&] {
+      std::this_thread::sleep_for(std::chrono::seconds(3));
+      CloseAndDelete();
+    });
+    kill.detach();
   }
 
   return true;
@@ -709,8 +728,16 @@ int32 TcpController::ReadData(byte* buf, int32 size) {
 
   std::unique_lock<std::mutex> lock(recv_buffer_mutex_);
   recv_buffer_read_cv_.wait(lock,
-      [this] { return pipe_state_ == EOF_NOT_CONSUMED ||
+      [this] { return shutdown_.load() ||
+                      pipe_state_ == EOF_NOT_CONSUMED ||
                       !recv_buffer_.empty(); });
+  if (shutdown_.load()) {
+    return -1;
+  }
+
+  if (pipe_state_ != EOF_NOT_CONSUMED && recv_buffer_.empty()) {
+    return -1;
+  }
 
   // EOF is received, and all data in receive buffer has been read by app,
   // Read() sys call now can return zero.
@@ -731,6 +758,7 @@ int32 TcpController::ReadData(byte* buf, int32 size) {
 
 int32 TcpController::WriteData(const byte* buf, int32 size) {
   {
+    // This should not happen. No data should be written after FIN is sent.
     std::unique_lock<std::mutex> lock(state_mutex_);
     if (InClosingState()) {
       return -1;
@@ -741,12 +769,17 @@ int32 TcpController::WriteData(const byte* buf, int32 size) {
   {
     std::unique_lock<std::mutex> lock(send_buffer_mutex_);
     // TODO: Non-blocking mode?
-    send_buffer_write_cv_.wait(lock,
-        [this] { return !send_buffer_.full(); });
+    send_buffer_write_cv_.wait(lock, [this] {
+        return shutdown_.load() || !send_buffer_.full();
+    });
+    if (shutdown_.load()) {
+      return -1;
+    }
+
     writen = send_buffer_.Write(buf, size);
   }
 
-  send_buffer_data_cv_.notify_one();
+  send_buffer_read_cv_.notify_one();
   return static_cast<int32>(writen);
 }
 
@@ -767,7 +800,6 @@ void TcpController::SendBufferListener() {
   }
 
   while (!shutdown_.load()) {
-
     // Wait for send window to be not full.
     std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
     send_window_cv_.wait(lock_send_window,
@@ -779,9 +811,9 @@ void TcpController::SendBufferListener() {
     }
     lock_send_window.unlock();
 
-    // Wait for socket send buffer to have data to send.
+    // Wait for socket send buffer have data to send.
     std::unique_lock<std::mutex> lock_send_buffer(send_buffer_mutex_);
-    send_buffer_data_cv_.wait(lock_send_buffer,
+    send_buffer_read_cv_.wait(lock_send_buffer,
         [this] { return shutdown_.load() || !send_buffer_.empty(); });
 
     if (shutdown_.load()) {
@@ -1011,7 +1043,7 @@ bool TcpController::InClosingState() {
   // Note CLOSE_WAIT state is not included. It still allows sending data.
   // A closing state could only be triggered by SendFIN.
   return state_ == FIN_WAIT_1 || state_ == FIN_WAIT_2 || state_ == TIME_WAIT ||
-         state_ == LAST_ACK;
+         state_ == CLOSING || state_ == LAST_ACK;
 }
 
 std::string TcpController::TcpStateStr(TCP_STATE state) {

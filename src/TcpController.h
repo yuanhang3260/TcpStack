@@ -47,6 +47,7 @@ class TcpController {
     FIN_WAIT_1,
     FIN_WAIT_2,
     TIME_WAIT,
+    CLOSING,
     CLOSE_WAIT,
     LAST_ACK,
   };
@@ -179,7 +180,7 @@ class TcpController {
   // Socket send buffer.
   Utility::RingBuffer send_buffer_;
   std::mutex send_buffer_mutex_;
-  std::condition_variable send_buffer_data_cv_;  // send buffer has data
+  std::condition_variable send_buffer_read_cv_;  // send buffer has data
   std::condition_variable send_buffer_write_cv_; // send buffer has space
 
   // Send window.
