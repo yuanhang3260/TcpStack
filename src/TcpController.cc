@@ -240,8 +240,9 @@ void TcpController::SendFIN() {
 
   // Note we wait for send window to clear and then send FIN, which means FIN
   // must the last packet to sent. Don't worry about many SendFIN() thread
-  // blocking. Process leve ShutDown() and Close() assures there could only be
-  // one call of TryShutDown, and no data packet could be sent after FIN.
+  // blocking. Process level ShutDown() and Close() assures that there could
+  // only be one call of TryShutDown(), and no data packet could be sent after
+  // SendFIN is called.
   std::shared_ptr<Packet> fin_pkt;
   {
     // Wait for send buffer is empty. It's okay to hold the lock because user

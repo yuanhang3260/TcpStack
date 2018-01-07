@@ -12,10 +12,10 @@ features:
 
 Everything is simulated (host, TCP endpoint, layer 1 & 2 network, etc). I
 implemented a very simple fake OS which only cotains network stack, and exposes
-Linux-like socket APIs to user, which is able to simualte network communication
+Linux-like socket APIs to user, which is able to simulate network communication
 transparently.
 
-A good example of playing with it is in main.cc which runs a very claasical
+A good example of playing with it is in main.cc which runs a classical
 server-client model: a simple server echoing back bytes sent from a client.
 
 <pre>
