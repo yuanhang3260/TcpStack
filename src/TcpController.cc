@@ -103,6 +103,7 @@ void TcpController::TearDown() {
   send_window_cv_.notify_all();
   send_buffer_read_cv_.notify_all();
   send_buffer_write_cv_.notify_all();
+  send_buffer_empty_cv_.notify_all();
   recv_buffer_read_cv_.notify_all();
 
   pkt_recv_buffer_.Stop();
