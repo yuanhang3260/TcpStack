@@ -1,10 +1,11 @@
 #include "Strings/Utils.h"
 #include "Utility/CleanUp.h"
 
-
 #include "Base/Ptr.h"
 #include "Base/Log.h"
 #include "Base/Utils.h"
+
+#include "debug.h"
 #include "Host.h"
 
 namespace net_stack {
@@ -37,6 +38,10 @@ Process::Process(Host* host, const std::string& name, Program program) :
   fd_pool_ = ptr::MakeUnique<NumPool>(kMinFd, kMaxFd);
 }
 
+std::string Process::hostname() const {
+  return host_->hostname();
+}
+
 void Process::Run() {
   program_(this);
   ReleaseResource();
@@ -50,7 +55,7 @@ void Process::ReleaseResource() {
     fds.push_back(it.first);
   }
   for (int32 fd : fds) {
-    host_->debuginfo(StrCat("closing fd ", std::to_string(fd)));
+    LOG(StrCat("closing fd ", std::to_string(fd)));
     Close(fd);
   }
 }
@@ -62,7 +67,7 @@ int32 Process::FindFdMappedFileId(int32 fd) {
   std::unique_lock<std::mutex> lock(fd_table_mutex_);
   auto it = fd_table_.find(fd);
   if (it == fd_table_.end()) {
-    host_->debuginfo(StrCat("Invalid fd ", std::to_string(fd),
+    LOG(StrCat("Invalid fd ", std::to_string(fd),
                             ", not allocated / or maybe closed?"));
     return -1;
   }
@@ -71,7 +76,7 @@ int32 Process::FindFdMappedFileId(int32 fd) {
 }
 
 int32 Process::Socket() {
-  host_->debuginfo("Socket()");
+  LOG("Socket()");
   // Allocate a new file descriptor.
   int32 fd = fd_pool_->Allocate();
   if (fd < 0) {
@@ -92,7 +97,7 @@ int32 Process::Socket() {
 
 bool Process::Bind(int32 socket_fd,
                    const std::string& local_ip, uint32 local_port) {
-  host_->debuginfo("Bind()");
+  LOG("Bind()");
   int32 open_file_id = FindFdMappedFileId(socket_fd);
   if (open_file_id < 0) {
     return false;
@@ -101,7 +106,7 @@ bool Process::Bind(int32 socket_fd,
 }
 
 bool Process::Listen(int32 socket_fd) {
-  host_->debuginfo("Listen()");
+  LOG("Listen()");
   int32 open_file_id = FindFdMappedFileId(socket_fd);
   if (open_file_id < 0) {
     return false;
@@ -110,7 +115,7 @@ bool Process::Listen(int32 socket_fd) {
 }
 
 int Process::Accept(int32 socket_fd) {
-  host_->debuginfo("Accept()");
+  LOG("Accept()");
   int32 open_file_id = FindFdMappedFileId(socket_fd);
   if (open_file_id < 0) {
     return false;
@@ -134,13 +139,13 @@ int Process::Accept(int32 socket_fd) {
 
   std::unique_lock<std::mutex> lock(fd_table_mutex_);
   fd_table_.emplace(new_fd, new_open_file_id);
-  host_->debuginfo("Accept fd = " + std::to_string(new_fd));
+  LOG("Accept fd = " + std::to_string(new_fd));
   return new_fd;
 }
 
 bool Process::Connect(int32 socket_fd,
                       const std::string& remote_ip, uint32 remote_port) {
-  host_->debuginfo("Connect()");
+  LOG("Connect()");
   int32 open_file_id = FindFdMappedFileId(socket_fd);
   if (open_file_id < 0) {
     return false;
@@ -150,7 +155,7 @@ bool Process::Connect(int32 socket_fd,
 }
 
 int32 Process::Read(int32 fd, byte* buffer, int32 size) {
-  host_->debuginfo("Read()");
+  LOG("Read()");
   int32 open_file_id = FindFdMappedFileId(fd);
   if (open_file_id < 0) {
     // Bad file descriptor error. It's closed and not mapped to any file/socket.
@@ -160,7 +165,7 @@ int32 Process::Read(int32 fd, byte* buffer, int32 size) {
 }
 
 int32 Process::Write(int32 fd, const byte* buffer, int32 size) {
-  host_->debuginfo("Write()");
+  LOG("Write()");
   int32 open_file_id = FindFdMappedFileId(fd);
   if (open_file_id < 0) {
     return false;
@@ -169,7 +174,7 @@ int32 Process::Write(int32 fd, const byte* buffer, int32 size) {
 }
 
 bool Process::ShutDown(int32 fd) {
-  host_->debuginfo("Shutdown()");
+  LOG("Shutdown()");
   int32 open_file_id = FindFdMappedFileId(fd);
   if (open_file_id < 0) {
     return false;
@@ -178,7 +183,7 @@ bool Process::ShutDown(int32 fd) {
 }
 
 bool Process::Close(int32 fd) {
-  host_->debuginfo("Close()");
+  LOG("Close()");
   // Close() is different from ShutDown(). Close() just closes the process
   // file descriptor that maps to the open file entry of this socket. It will
   // decrease the open file reference count. When reference count becomes zero,
@@ -469,12 +474,13 @@ void Host::DemultiplexPacketsToTcps(
     if (it == connections_.end()) {
       connections_lock.unlock();
       if (!HandleNewConnection(*pkt)) {
-        LogERROR("%s: Can't find tcp connection %s",
-                 hostname_.c_str(), tcp_key.DebugString().c_str());
+        LogINFO("%s: Can't find tcp connection %s",
+                hostname_.c_str(), tcp_key.DebugString().c_str());
         // Send RST to the other side.
         // But first check this packet is not an RST! Otherwise both sides will
         // infinitely repeat sending RST to each other.
         if (!pkt->tcp_header().rst) {
+          LOG("Host sending back RST")
           SendBackRST(tcp_key);
         }
         continue;
@@ -501,7 +507,7 @@ void Host::SendBackRST(TcpControllerKey tcp_key) {
 
 bool Host::HandleNewConnection(const Packet& pkt) {
   if (!pkt.tcp_header().sync) {
-    LogERROR("Not a sync packet, skip creating new tcp connection");
+    // Not a sync packet, discard it.
     return false;
   }
 
@@ -587,7 +593,7 @@ void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
   // its socket.
   tcp_con->WaitForReadyToDestroy();
 
-  debuginfo(Strings::StrCat(
+  LOG(Strings::StrCat(
       "Connection ", tcp_key.DebugString(), " safely deleted ^_^"));
 }
 
@@ -648,10 +654,6 @@ bool Host::ShutDownSocket(int32 open_file_id) {
   }
 
   return true;
-}
-
-void Host::debuginfo(const std::string& msg) {
-  LogINFO((hostname_ + ": " + msg).c_str());
 }
 
 }  // namespace net_stack

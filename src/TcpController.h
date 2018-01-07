@@ -139,7 +139,7 @@ class TcpController {
 
   uint32 GetNewSendWindowSize(uint32 rwnd);
 
-  void debuginfo(const std::string& msg);
+  std::string hostname() const;
 
   Host* host_ = nullptr;
   TcpControllerKey key_;
@@ -182,6 +182,7 @@ class TcpController {
   std::mutex send_buffer_mutex_;
   std::condition_variable send_buffer_read_cv_;  // send buffer has data
   std::condition_variable send_buffer_write_cv_; // send buffer has space
+  std::condition_variable send_buffer_empty_cv_; // send buffer is empty
 
   // Send window.
   SendWindow send_window_;

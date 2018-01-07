@@ -49,6 +49,8 @@ class Process {
   bool ShutDown(int32 fd);
   bool Close(int32 fd);
 
+  std::string hostname() const;
+
  private:
   int32 FindFdMappedFileId(int32 fd);
 
@@ -134,8 +136,6 @@ class Host {
   // Port resource management.
   uint32 GetRandomPort();
   void ReleasePort(uint32 port);
-
-  void debuginfo(const std::string& msg);
 
   std::string hostname_;
   std::string local_ip_address_;  // Human readable IP address (aa.bb.cc.dd)

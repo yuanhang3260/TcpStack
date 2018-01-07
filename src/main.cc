@@ -1,3 +1,5 @@
+#include <unistd.h>
+
 #include "Base/Log.h"
 #include "Base/Utils.h"
 
@@ -44,6 +46,9 @@ bool ReceivedDataCorrect() {
 }
 
 void Client(Process* process) {
+  // Client starts with delay 500ms to until servers are already up.
+  usleep(100 * 1000);
+
   // Create client socket.
   int fd = process->Socket();
   if (fd < 0) {
@@ -82,10 +87,13 @@ void Client(Process* process) {
   // Receive data from server, verify bytes are flipped.
   uint32 readn = 0;
   byte client_buffer[kTestDataSize];
-  while (readn < kTestDataSize) {
+  while (true) {
     auto re = process->Read(fd, client_buffer + readn, kTestDataSize);
     if (re > 0) {
       readn += re;
+    } else if (re == 0) {
+      // Client wait for server to close connection and then stop reading.
+      break;
     } else {
       break;
     }
@@ -107,6 +115,10 @@ void Client(Process* process) {
   if (flip_correct) {
     LogINFO("Alice received correct data \033[2;32m:)\033[0m");
   }
+
+  // Test an socket misuse case - send data to a connection already closed by
+  // the other side.
+  // process->Write(fd, data, kTestDataSize);
 
   process->Close(fd);
 }
@@ -168,7 +180,7 @@ void Server(Process* process) {
     if (!ReceivedDataCorrect()) {
       LogERROR("Receive data failed");
     } else {
-      LogINFO("Bob received correct data \033[2;32m:)\033[0m");
+      LogINFO("Bob received correct data \033[2;32m4:)\033[0m");
     }
 
     // Service: Flip each byte and send back to client.
@@ -211,14 +223,15 @@ int main(int argc, char** argv) {
   channel_alice_to_bob.Start();
   channel_bob_to_alice.Start();
 
-  // Create data to send.
+  // Start hosts and run forever.
+  bob.RunForever();
+  alice.RunForever();
+
+  // // Create data to send.
   InitData();
 
-  alice.CreateProcess("Client", Client);
   bob.CreateProcess("Server", Server);
+  alice.CreateProcess("Client", Client);
 
-  // Start hosts and run forever.
-  alice.RunForever();
-  bob.RunForever();
   while (true) {}
 }

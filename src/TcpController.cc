@@ -6,6 +6,8 @@
 #include "Base/Log.h"
 #include "Base/MacroUtils.h"
 #include "Base/Utils.h"
+
+#include "debug.h"
 #include "Host.h"
 #include "TcpController.h"
 
@@ -90,6 +92,10 @@ TcpControllerOptions TcpController::GetDefaultOptions() {
 TcpController::~TcpController() {
 }
 
+std::string TcpController::hostname() const {
+  return host_->hostname();
+}
+
 void TcpController::TearDown() {
   timer_.Stop();
 
@@ -107,7 +113,7 @@ void TcpController::TearDown() {
   thread_pool_.Stop();
   thread_pool_.AwaitTermination();
 
-  usleep(500);
+  usleep(50 * 1000);
 }
 
 void TcpController::DetachSocket() {
@@ -163,8 +169,9 @@ bool TcpController::TryShutDown() {
 
   // Send FIN segment. From now on there should be no more data to send. The
   // TCP will transit to FIN_WAIT_1 or LAST_ACK, and InClosingState will return
-  // true.
-  SendFIN();
+  // true. Note we send it asynchronously because SendFIN can block when send
+  // window has no space.
+  thread_pool_.AddTask(std::bind(&TcpController::SendFIN, this));
   return true;
 }
 
@@ -221,9 +228,6 @@ void TcpController::SendRSTForClosedConnection() {
     // Receive buffer is not empty after connection has been closed, send RST
     // immediately.
     SendPacket(std::move(MakeRstPacket()));
-    // std::queue<std::unique_ptr<Packet>> packets_to_send;
-    // packets_to_send.push(std::move(MakeRstPacket()));
-    // host_->MultiplexPacketsFromTcp(&packets_to_send);
   }
 }
 
@@ -232,12 +236,30 @@ void TcpController::SendFIN() {
     return;
   }
 
-  debuginfo("Sending FIN...");
+  LOG("Sending FIN...");
 
-  // Send FIN and transit TCP state.
+  // Note we wait for send window to clear and then send FIN, which means FIN
+  // must the last packet to sent. Don't worry about many SendFIN() thread
+  // blocking. Process leve ShutDown() and Close() assures there could only be
+  // one call of TryShutDown, and no data packet could be sent after FIN.
   std::shared_ptr<Packet> fin_pkt;
   {
+    // Wait for send buffer is empty. It's okay to hold the lock because user
+    // can not write data to send buffer any more.
+    std::unique_lock<std::mutex> lock_send_buffer(send_buffer_mutex_);
+    send_buffer_empty_cv_.wait(lock_send_buffer,
+        [this] { return shutdown_.load() || send_buffer_.empty(); });
+
+    if (shutdown_.load()) {
+      return;
+    }
+
+    // Since send buffer is cleared and all data has been packed and delivered
+    // to send window, and no more data will be sent any more, we can safely
+    // increase send window size, and successfully send this FIN.
     std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
+    send_window_.set_capacity(send_window_.size() + 1);
+
     fin_pkt = MakeFinPacket(send_window_.NextSeqNumberToSend());
     if (!send_window_.SendPacket(fin_pkt)) {
       LogFATAL("Failed to send FIN segment");
@@ -304,7 +326,8 @@ void TcpController::HandleReceivedPackets(
 }
 
 bool TcpController::HandleRst() {
-  // Handle RST is easy - Just terminate this TCP connection.
+  // Handle RST is easy - Just terminate this TCP connection immediately.
+  LOG("Got RST");
   CloseAndDelete();
   return true;
 }
@@ -317,11 +340,12 @@ bool TcpController::HandleDataPacket(std::unique_ptr<Packet> pkt) {
     return true;
   }
 
-  // Handle data packet. Deliver packets to upper layer (socket receive
-  // buffer) if avaible, and sends ack packet back to sender.
+  // Handle data packet. Deliver data to receive buffer, and ACK back.
   auto pair = recv_window_.ReceivePacket(std::move(pkt));
   StreamDataToReceiveBuffer(pair.second);
 
+  // Note we must first steam data to receive buffer, because ACK packet will
+  // report receive buffer free space back to sender for flow control. 
   SendPacket(std::move(MakeAckPacket(pair.first)));
   return true;
 }
@@ -356,13 +380,6 @@ bool TcpController::HandleSYN(std::unique_ptr<Packet> pkt) {
   auto sync_ack_pkt = MakeSyncPacket(server_seq_num);
   sync_ack_pkt->mutable_tcp_header()->ack = true;
   sync_ack_pkt->mutable_tcp_header()->ack_num = pair.first;
-  {
-    // This SYN_ACK packet contains server's receive window size so that
-    // client can init its flow control before sending any data packet.
-    std::unique_lock<std::mutex> recv_buffer_lock(recv_buffer_mutex_);
-    sync_ack_pkt->mutable_tcp_header()
-                    ->window_size = recv_buffer_.free_space();
-  }
 
   // SYN_ACK packet is firstly a SYN packet. It needs to be recorded in
   // send window.
@@ -374,11 +391,6 @@ bool TcpController::HandleSYN(std::unique_ptr<Packet> pkt) {
     }
   }
 
-  // Really send SYN_ACK segment.
-  SendPacket(std::unique_ptr<Packet>(sync_ack_pkt->Copy()));
-  timer_.Restart(CurrentTimeOut());
-  syn_timer_.Restart();
-
   // Server's TCP state transit to SYN_RCVD. For now, server can call socket
   // Write() to write data into socket buffer, but no data packet will be
   // actually sent. It must wait for the final ACK (3rd handshake from client)
@@ -387,6 +399,11 @@ bool TcpController::HandleSYN(std::unique_ptr<Packet> pkt) {
     std::unique_lock<std::mutex> state_lock(state_mutex_);
     state_ = SYN_RCVD;
   }
+
+  // Really send SYN_ACK segment.
+  SendPacket(std::unique_ptr<Packet>(sync_ack_pkt->Copy()));
+  timer_.Restart(CurrentTimeOut());
+  syn_timer_.Restart();
 
   // Wait for client's ack packet (3rd handshake). It should be a normal
   // ack segment sent from client with ack_num = server_seq_num + 1.
@@ -413,14 +430,14 @@ bool TcpController::HandleACKSYN(std::unique_ptr<Packet> pkt) {
       }
       uint32 new_send_window_capacity =
           GetNewSendWindowSize(pkt->tcp_header().window_size);
-      debuginfo("set window_size = " +
+      LOG("set window_size = " +
                 std::to_string(new_send_window_capacity));
       send_window_.set_capacity(new_send_window_capacity);
     }
 
     // Mark client --> server connection is ready.
     state_ = ESTABLISHED;
-    debuginfo("Client --> Server connection established ^_^");
+    LOG("Client --> Server connection established ^_^");
     state_cv_.notify_one();
   }
   state_lock.unlock();
@@ -441,10 +458,10 @@ bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
   if (state_ == ESTABLISHED) {
     // CLOSE_WAIT state waits for app to call Close() or ShutDown() to send FIN
     // back to the other side.
-    debuginfo("Got FIN 1");
+    LOG("Got FIN 1");
     state_ = CLOSE_WAIT;
   } else if (state_ == FIN_WAIT_2) {
-    debuginfo("Got FIN 2");
+    LOG("Got FIN 2");
     state_ = TIME_WAIT;
 
     // Wait for 2 * MSL (typically it should last 1 ~ 2 minutes), and terminate
@@ -456,7 +473,7 @@ bool TcpController::HandleFIN(std::unique_ptr<Packet> pkt) {
     kill.detach();
   } else if (state_ == FIN_WAIT_1) {
     // This is simultaneous close case. TCP state should transit to CLOSING.
-    debuginfo("Got FIN 1, simultaneous close");
+    LOG("Got FIN 1, simultaneous close");
     state_ = CLOSING;
   }
   state_lock.unlock();
@@ -486,7 +503,7 @@ void TcpController::CloseAndDelete() {
     std::unique_lock<std::mutex> lock(destroy_mutex_);
     destroy_ = true;
     destroy_cv_.notify_one();
-    debuginfo("destroy");
+    LOG("destroy");
   });
   shut_down.detach();
 
@@ -593,8 +610,7 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
   // Flow control - set send window size as receiver indicated.
   uint32 new_send_window_capacity =
       GetNewSendWindowSize(pkt->tcp_header().window_size);
-  debuginfo("set window_size = " +
-            std::to_string(new_send_window_capacity));
+  LOG("set window_size = " + std::to_string(new_send_window_capacity));
   send_window_.set_capacity(new_send_window_capacity);
 
   // If send window has free space, notify packet send thread.
@@ -611,18 +627,18 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
     // connection is ready to send data.
     state_ = ESTABLISHED;
     syn_timer_.Stop();
-    debuginfo("Server --> Client connection established ^_^");
+    LOG("Server --> Client connection established ^_^");
     state_cv_.notify_one();
   } else if (state_ == FIN_WAIT_1 && send_window_empty) {
     // Note this ACK may not be acking the FIN we previously sent. It might
     // just be a regular data packet ACK. So we must check send window is
     // already cleared, since there's no packet in send window after FIN packet.
     // In this way we know for sure this ACK is the FIN ACK we are expecting.
-    debuginfo("Got ACK for FIN 1");
+    LOG("Got ACK for FIN 1");
     state_ = FIN_WAIT_2;
     fin_timer_.Stop();
   } else if (state_ == LAST_ACK && send_window_empty) {
-    debuginfo("Got LAST_ACK");
+    LOG("Got LAST_ACK");
     // Same as above, need to check send_window_empty. If received last ack,
     // this TCP connection can finally be closed.
     state_ = CLOSED;
@@ -673,8 +689,8 @@ void TcpController::StreamDataToReceiveBuffer(
         uint32 writen =
             recv_buffer_.Write(pkt->payload(), pkt->payload_size());
         if (writen <= 0) {
-          LogERROR("Socket receive buffer is full, pkt seq = %u is overflowd.",
-                   pkt->tcp_header().seq_num);
+          LogINFO("Socket receive buffer is full, pkt seq = %u is overflowd.",
+                  pkt->tcp_header().seq_num);
           overflow_pkts_.push(pkt);
         }
       } else {
@@ -800,7 +816,10 @@ void TcpController::SendBufferListener() {
   }
 
   while (!shutdown_.load()) {
-    // Wait for send window to be not full.
+    // Wait for send window to be not full. Note we lock send window first,
+    // and this lock will be hold throughout this while loop. We cannot lock
+    // send buffer first and then wait for send window to become available,
+    // because that might block user writing data to send buffer.
     std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
     send_window_cv_.wait(lock_send_window,
                          [this] { return shutdown_.load() ||
@@ -829,29 +848,28 @@ void TcpController::SendBufferListener() {
     }
 
     // Create data packets and send them out.
-    uint32 size_to_send = 0;
-    if (send_window_.capacity() == 0) {
-      // Send a packet with size = 0, and continue to check if send window has
-      // capacity and space. Don't repeatedly send lots of one-byte packets.
-      size_to_send = 0;
-      // bool restart_timer = (send_window_.NumPacketsToAck() == 0);
+    // uint32 size_to_send = 0;
+    // if (send_window_.capacity() == 0) {
+    //   // Send a packet with size = 0, and continue to check if send window has
+    //   // capacity and space. Don't repeatedly send lots of one-byte packets.
+    //   auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
+    //                                      &send_buffer_, 0);
 
-      auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
-                                         &send_buffer_, size_to_send);
-      // This just mark the new pkt into send window.
-      // if (!send_window_.SendPacket(new_data_pkt)) {
-      //   continue;
-      // }
-      // Really send the packet.
-      SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
-      // if (restart_timer) {
-      //   timer_.Restart();
-      // }
-      //send_buffer_write_cv_.notify_one();
-      continue;
-    } else {
-      size_to_send = Utils::Min(send_window_.free_space(), send_buffer_.size());
+    //   SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
+    //   continue;
+    // } else {
+    //   size_to_send = Utils::Min(send_window_.free_space(), send_buffer_.size());
+    // }
+
+    if (send_window_.capacity() == 0) {
+      // Increase one more extra byte to send window capacity, and then we can
+      // send one more one-byte packet to the other side as window size prober.
+      LOG("Probing window size");
+      send_window_.set_capacity(send_window_.size() + 1);
     }
+
+    int size_to_send = Utils::Min(send_window_.free_space(),
+                                  send_buffer_.size());
 
     uint32 num_pkts = size_to_send / kDefaultDataPacketSize;
     uint32 last_pkt_size = size_to_send % kDefaultDataPacketSize;
@@ -885,6 +903,11 @@ void TcpController::SendBufferListener() {
     }
     // Notify new data can be written to send buffer from user space.
     send_buffer_write_cv_.notify_one();
+
+    // If send buffer is cleared, notify SendFIN.
+    if (send_buffer_.empty()) {
+      send_buffer_empty_cv_.notify_one();
+    }
   }
 }
 
@@ -893,7 +916,7 @@ void TcpController::SendPacket(std::unique_ptr<Packet> pkt) {
     return;
   }
 
-  debuginfo(pkt->DebugString());
+  LOG(pkt->DebugString());
 
   pkt_send_buffer_.Push(std::move(pkt));
 }
@@ -988,6 +1011,11 @@ std::shared_ptr<Packet> TcpController::MakeSyncPacket(uint32 seq_num) {
   tcp_header.sync = true;
   tcp_header.seq_num = seq_num;
 
+  {
+    std::unique_lock<std::mutex> recv_buffer_lock(recv_buffer_mutex_);
+    tcp_header.window_size = recv_buffer_.free_space();
+  }
+
   std::shared_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
   pkt->set_payload_size(1);
   return pkt;
@@ -1021,10 +1049,6 @@ std::unique_ptr<Packet> TcpController::MakeRstPacket() {
 
   std::unique_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
   return pkt;
-}
-
-void TcpController::debuginfo(const std::string& msg) {
-  LogINFO((host_->hostname() + ": " + msg).c_str());
 }
 
 void TcpController::WaitForReadyToDestroy() {
