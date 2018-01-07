@@ -40,4 +40,4 @@ Workflow            Socket()                  Socket()
   
   
 #### Code
-src/Public directory points to my own C++ libraries https://github.com/yuanhang3260/HyLib
+[src/Public](https://github.com/yuanhang3260/HyLib) directory points to my own C++ libraries.
