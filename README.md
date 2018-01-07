@@ -17,7 +17,8 @@ transparently.
 
 A good example of playing with it is in main.cc which runs a very claasical
 server-client model: a simple server echoing back bytes sent from a client.
-      
+
+<pre>
 Host                 Alice                     Bob
                        |                        |
 Prceoss              Client                   Server
@@ -35,3 +36,4 @@ Workflow            Socket()                  Socket()
                      Close()                   Write()
                                                  |
                                                Close()
+</pre>
