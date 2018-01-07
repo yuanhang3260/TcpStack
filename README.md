@@ -29,11 +29,11 @@ Workflow            Socket()                  Socket()
                        |                         |
                     Connect()                 Listen()
                        |                         |
-                     Read()                   Accept()
+                       |                      Accept()
                        |                         |
                      Write()                   Read()
                        |                         |
-                     Close()                   Write()
-                                                 |
-                                               Close()
+                     Read()                    Write()
+                       |                         |
+                     Close()                   Close()
 </pre>
