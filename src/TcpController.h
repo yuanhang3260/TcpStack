@@ -110,6 +110,9 @@ class TcpController {
   // Timeout callback.
   void TimeoutReTransmitter();
 
+  // Send prober packet.
+  void ProbeWindowSize();
+
   std::shared_ptr<Packet> MakeDataPacket(
       uint32 seq_num, const byte* data, uint32 size);
   std::shared_ptr<Packet> MakeDataPacket(
@@ -201,6 +204,7 @@ class TcpController {
   Utility::Timer syn_timer_;
   Utility::Timer fin_timer_;
   Utility::Timer close_timer_;
+  Utility::Timer prober_timer_;  // send window size prober timer
 
 
   // **************************** TCP state ********************************* //

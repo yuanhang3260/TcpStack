@@ -26,13 +26,13 @@ class SendWindowTest: public UnitTest {
     AssertTrue(send_window_.SendPacket(MakePacket(5, "hello")));
     AssertTrue(send_window_.SendPacket(MakePacket(10, "hello")));
 
-    AssertTrue(send_window_.NewAckedPacket(5));
+    AssertTrue(send_window_.NewAckedPacket(5).ack_refreshed);
     AssertEqual(5, send_window_.send_base());
 
-    AssertTrue(send_window_.NewAckedPacket(10));
+    AssertTrue(send_window_.NewAckedPacket(10).ack_refreshed);
     AssertEqual(10, send_window_.send_base());
 
-    AssertTrue(send_window_.NewAckedPacket(15));
+    AssertTrue(send_window_.NewAckedPacket(15).ack_refreshed);
     AssertEqual(15, send_window_.send_base());
   }
 
@@ -41,10 +41,10 @@ class SendWindowTest: public UnitTest {
     AssertTrue(send_window_.SendPacket(MakePacket(5, "hello")));
     AssertTrue(send_window_.SendPacket(MakePacket(10, "hello")));
 
-    AssertTrue(send_window_.NewAckedPacket(5));
+    AssertTrue(send_window_.NewAckedPacket(5).ack_refreshed);
     AssertEqual(5, send_window_.send_base());
 
-    AssertTrue(send_window_.NewAckedPacket(15));
+    AssertTrue(send_window_.NewAckedPacket(15).ack_refreshed);
     AssertEqual(15, send_window_.send_base());
   }
 
@@ -53,17 +53,20 @@ class SendWindowTest: public UnitTest {
     AssertTrue(send_window_.SendPacket(MakePacket(5, "hello")));
     AssertTrue(send_window_.SendPacket(MakePacket(10, "hello")));
 
-    AssertTrue(send_window_.NewAckedPacket(5));
+    AssertTrue(send_window_.NewAckedPacket(5).ack_refreshed);
     AssertEqual(5, send_window_.send_base());
 
-    AssertTrue(send_window_.NewAckedPacket(5));
+    AssertFalse(send_window_.NewAckedPacket(5).ack_refreshed);
+    AssertFalse(send_window_.NewAckedPacket(5).re_transmit);
     AssertEqual(5, send_window_.send_base());
 
     // Third ack num 5. Maybe we should re-transmit packet 5.
-    AssertFalse(send_window_.NewAckedPacket(5));
+    AssertFalse(send_window_.NewAckedPacket(5).ack_refreshed);
+    AssertTrue(send_window_.NewAckedPacket(5).re_transmit);
     AssertEqual(5, send_window_.send_base());
 
-    AssertTrue(send_window_.NewAckedPacket(15));
+    AssertTrue(send_window_.NewAckedPacket(15).ack_refreshed);
+    AssertFalse(send_window_.NewAckedPacket(5).re_transmit);
     AssertEqual(15, send_window_.send_base());
   }
 
@@ -77,12 +80,12 @@ class SendWindowTest: public UnitTest {
     AssertTrue(send_window.SendPacket(MakePacket(13, "hello")));
     AssertEqual(5, send_window.NumPacketsToAck());
 
-    AssertTrue(send_window.NewAckedPacket(13));
+    AssertTrue(send_window.NewAckedPacket(13).ack_refreshed);
     AssertEqual((uint32)13, send_window.send_base());
     AssertEqual((uint32)5, send_window.size());
     AssertEqual(1, send_window.NumPacketsToAck());
 
-    AssertTrue(send_window.NewAckedPacket(18));
+    AssertTrue(send_window.NewAckedPacket(18).ack_refreshed);
     AssertEqual((uint32)18, send_window.send_base());
     AssertEqual((uint32)0, send_window.size());
     AssertEqual(0, send_window.NumPacketsToAck());

@@ -11,6 +11,7 @@ IFLAGS=-Isrc/ -Isrc/Public/
 
 SRC_DIR=src
 OBJ_DIR=lib
+TEST_DIR=test
 
 HYLIB_DIR=../HyLib/
 HYLIB=../HyLib/libhy.a
@@ -40,9 +41,12 @@ TESTEXE = test/PacketQueue_test.out \
 
 MAINOBJ = $(OBJ_DIR)/main.o
 
-all: libhy library main
+all: libhy pre_build library main
 
-test: library $(TESTEXE)
+pre_build:
+	mkdir -p $(TEST_DIR) $(OBJ_DIR)
+
+test: pre_build library $(TESTEXE)
 
 libhy:
 	+$(MAKE) -C $(HYLIB_DIR)

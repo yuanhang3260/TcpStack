@@ -15,6 +15,8 @@ namespace net_stack {
 
 namespace {
 
+using Utility::Timer;
+
 uint32 kThreadPoolSize = 9;
 
 uint32 kDefaultDataPacketSize = 10;
@@ -50,11 +52,13 @@ TcpController::TcpController(Host* host,
     timer_(std::chrono::milliseconds(5 * 100),
            std::bind(&TcpController::TimeoutReTransmitter, this)),
     syn_timer_(std::chrono::seconds(2),
-           std::bind(&TcpController::CloseAndDelete, this)),
+               std::bind(&TcpController::CloseAndDelete, this)),
     fin_timer_(std::chrono::seconds(30),
-           std::bind(&TcpController::CloseAndDelete, this)),
+               std::bind(&TcpController::CloseAndDelete, this)),
     close_timer_(std::chrono::seconds(30),
-           std::bind(&TcpController::CloseAndDelete, this)) {
+                 std::bind(&TcpController::CloseAndDelete, this)),
+    prober_timer_(std::chrono::milliseconds(5 * 100),
+                  std::bind(&TcpController::ProbeWindowSize, this)) {
   state_ = CLOSED;
   pipe_state_ = OPEN;
 
@@ -614,6 +618,9 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
       GetNewSendWindowSize(pkt->tcp_header().window_size);
   LOG("set window_size = " + std::to_string(new_send_window_capacity));
   send_window_.set_capacity(new_send_window_capacity);
+  if (new_send_window_capacity > 0) {
+    prober_timer_.Stop();
+  }
 
   // If send window has free space, notify packet send thread.
   if (send_window_.free_space() > 0 || send_window_.capacity() == 0) {
@@ -823,10 +830,11 @@ void TcpController::SendBufferListener() {
     // send buffer first and then wait for send window to become available,
     // because that might block user writing data to send buffer.
     std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
-    send_window_cv_.wait(lock_send_window,
-                         [this] { return shutdown_.load() ||
-                                         send_window_.free_space() > 0 ||
-                                         send_window_.capacity() <= 0; });
+    send_window_cv_.wait(lock_send_window, [this] {
+      return shutdown_.load() || send_window_.free_space() > 0 ||
+             (send_window_.capacity() <= 0 &&
+              prober_timer_.state() != Timer::STARTED);
+    });
     if (shutdown_.load()) {
       return;
     }
@@ -849,27 +857,17 @@ void TcpController::SendBufferListener() {
       continue;
     }
 
-    // Create data packets and send them out.
-    // uint32 size_to_send = 0;
-    // if (send_window_.capacity() == 0) {
-    //   // Send a packet with size = 0, and continue to check if send window has
-    //   // capacity and space. Don't repeatedly send lots of one-byte packets.
-    //   auto new_data_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
-    //                                      &send_buffer_, 0);
-
-    //   SendPacket(std::unique_ptr<Packet>(new_data_pkt->Copy()));
-    //   continue;
-    // } else {
-    //   size_to_send = Utils::Min(send_window_.free_space(), send_buffer_.size());
-    // }
-
+    // Probe window size if neccessary.
     if (send_window_.capacity() == 0) {
-      // Increase one more extra byte to send window capacity, and then we can
-      // send one more one-byte packet to the other side as window size prober.
-      LOG("Probing window size");
-      send_window_.set_capacity(send_window_.size() + 1);
+      // Start the window size prober timer. It periodically send prober packet
+      // to the other side.
+      if (prober_timer_.state() != Timer::STARTED) {
+        prober_timer_.Restart();
+      }
+      continue;
     }
 
+    // Create data packets and send them out.
     int size_to_send = Utils::Min(send_window_.free_space(),
                                   send_buffer_.size());
 
@@ -910,6 +908,19 @@ void TcpController::SendBufferListener() {
     if (send_buffer_.empty()) {
       send_buffer_empty_cv_.notify_one();
     }
+  }
+}
+
+void TcpController::ProbeWindowSize() {
+  // TODO: Send zero-byte prober packet, or one-byte packet? Linux system uses
+  // the former.
+  std::unique_lock<std::mutex> lock_send_window(send_window_mutex_);
+  if (send_window_.capacity() == 0) {
+    LOG("Probe window size");
+    // Send a prober packet without any data. 
+    auto prober_pkt = MakeDataPacket(send_window_.NextSeqNumberToSend(),
+                                     (const byte*)nullptr, 0);
+    SendPacket(std::unique_ptr<Packet>(prober_pkt->Copy()));
   }
 }
 
