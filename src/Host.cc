@@ -584,14 +584,8 @@ void Host::DeleteTcpConnection(const TcpControllerKey& tcp_key) {
              tcp_key.DebugString().c_str());
     return;
   }
-  std::unique_ptr<TcpController> tcp_con = std::move(it->second);
   connections_.erase(it);
   connections_lock.unlock();
-
-  // Wait for TCP connection cleaned up its internal resource and is ready to
-  // be deleted. Note in this function the TcpConnection will be detached from
-  // its socket.
-  tcp_con->WaitForReadyToDestroy();
 
   LOG(Strings::StrCat(
       "Connection ", tcp_key.DebugString(), " safely deleted ^_^"));

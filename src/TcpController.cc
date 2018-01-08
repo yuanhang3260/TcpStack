@@ -70,6 +70,7 @@ TcpController::TcpController(Host* host,
   ssthresh_ = kInitialSSThresh;
 
   timer_.SetRepeat(true);
+  prober_timer_.SetRepeat(true);
 
   thread_pool_.AddTask(
       std::bind(&TcpController::PacketReceiveBufferListener, this));
@@ -502,21 +503,17 @@ void TcpController::CloseAndDelete() {
   shutdown_.store(true);
 
   std::thread shut_down([&] {
+    // Wait for all threads to finish and internal resource to clean up, and
+    // then we can safely delete this TCP connection from host.
     TearDown();
-    // Notify host to delete this connection and all its resource,
-    // after current thread exits. This should be the last thread bound
-    // of this connection object.
-    std::unique_lock<std::mutex> lock(destroy_mutex_);
-    destroy_ = true;
-    destroy_cv_.notify_one();
+
     LOG("destroy");
+    // Note we make a copy of TcpControllerKey and pass to DeleteTcpConnection,
+    // since the reference of key_ will be deleted inside DeleteTcpConnection.
+    TcpControllerKey key = key_;
+    host_->DeleteTcpConnection(key);
   });
   shut_down.detach();
-
-  // Host will wait for TearDown() to complete.
-  std::thread final_clean(
-      std::bind(&Host::DeleteTcpConnection, host_, key_));
-  final_clean.detach();
 }
 
 void TcpController::UpdateRTT(std::chrono::nanoseconds new_rtt) {
@@ -1062,12 +1059,6 @@ std::unique_ptr<Packet> TcpController::MakeRstPacket() {
 
   std::unique_ptr<Packet> pkt(new Packet(ip_header, tcp_header));
   return pkt;
-}
-
-void TcpController::WaitForReadyToDestroy() {
-  // Wait for destroy signal.
-  std::unique_lock<std::mutex> lock(destroy_mutex_);
-  destroy_cv_.wait(lock, [&] { return destroy_; });
 }
 
 bool TcpController::InConnectingState() {

@@ -76,9 +76,6 @@ class TcpController {
   // Terminate this connection. It stops all threads of this connection object.
   void TearDown();
 
-  // This is called by host to wait for this connection object can be deleted.
-  void WaitForReadyToDestroy();
-
  private:
   // These methods serve uplink packet/data delivery (receive data).
   void PacketReceiveBufferListener();
@@ -231,10 +228,6 @@ class TcpController {
   std::mutex cc_mutex_;
 
   std::atomic_bool shutdown_;
-
-  bool destroy_ = false;
-  std::mutex destroy_mutex_;
-  std::condition_variable destroy_cv_;
 };
 
 }  // namespace net_stack
