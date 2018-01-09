@@ -95,10 +95,19 @@ TcpControllerOptions TcpController::GetDefaultOptions() {
 }
 
 TcpController::~TcpController() {
+  TearDown();
 }
 
 std::string TcpController::hostname() const {
   return host_->hostname();
+}
+
+const TcpControllerKey& TcpController::key() const {
+  return key_;
+}
+
+TcpController::TCP_STATE TcpController::state() const {
+  return state_;
 }
 
 void TcpController::TearDown() {
@@ -118,6 +127,10 @@ void TcpController::TearDown() {
 
   thread_pool_.Stop();
   thread_pool_.AwaitTermination();
+
+  if (release_port_) {
+    host_->ReleasePort(key_.dest_port);
+  }
 
   usleep(50 * 1000);
 }
@@ -1072,6 +1085,10 @@ bool TcpController::InClosingState() {
   // A closing state could only be triggered by SendFIN.
   return state_ == FIN_WAIT_1 || state_ == FIN_WAIT_2 || state_ == TIME_WAIT ||
          state_ == CLOSING || state_ == LAST_ACK;
+}
+
+void TcpController::SetReleasePort(bool set) {
+  release_port_ = set;
 }
 
 std::string TcpController::TcpStateStr(TCP_STATE state) {

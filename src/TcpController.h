@@ -76,6 +76,13 @@ class TcpController {
   // Terminate this connection. It stops all threads of this connection object.
   void TearDown();
 
+  // If set true, this TCP connection is responsible for releasing port in
+  // clean up.
+  void SetReleasePort(bool set);
+
+  const TcpControllerKey& key() const;
+  TCP_STATE state() const;
+
  private:
   // These methods serve uplink packet/data delivery (receive data).
   void PacketReceiveBufferListener();
@@ -228,6 +235,8 @@ class TcpController {
   std::mutex cc_mutex_;
 
   std::atomic_bool shutdown_;
+
+  bool release_port_ = false;
 };
 
 }  // namespace net_stack

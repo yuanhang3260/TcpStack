@@ -127,13 +127,12 @@ int Process::Accept(int32 socket_fd) {
   int32 new_open_file_id = host_->SocketAccept(open_file_id);
   int32 new_fd = fd_pool_->Allocate();
   if (new_fd < 0) {
-    // TODO: What happens if allocating new fd fails? Kernel will still keep
-    // the socket object in open file table, but no process fd will map to it.
-    // The open file will be ab dangling entry in table. So we should close
-    // this socket and connection in kernel. Kernel will immediately send a RST
-    // to the TCP connection.
-
-    // SendBackRST(tcp_key);
+    // What happens if allocating new fd fails? Kernel will still keep this
+    // socket object in open file table, but no process fd will map to it.
+    // The open file will be an dangling entry in table. So we should close
+    // this socket and connection in kernel, and immediately send an RST to
+    // the other side.
+    host_->DeleteSocketAndConnection(open_file_id);
     return -1;
   }
 
@@ -304,7 +303,17 @@ int32 Host::DecOpenFileRef(int32 open_file_id) {
     // closed connection. These are all implemented in TcpController::TryClose.
     if (socket->tcp_con != nullptr) {
       TcpController* tcp_con = socket->tcp_con;
+      if (socket->isBound()) {
+        tcp_con->SetReleasePort(true);
+      }
       tcp_con->TryClose();
+    } else {
+      // If the TCP connection bound to this socket has been closed, release the
+      // port of socket has bound. Otherwise, TCP connection connection itself
+      // should be responsible for port releasing.
+      if (socket->isBound()) {
+        ReleasePort(socket->local_bound.local_port);
+      }
     }
 
     // Delete socket from open file table.
@@ -549,7 +558,13 @@ bool Host::HandleNewConnection(const Packet& pkt) {
     connections_.emplace(tcp_key,
                          ptr::MakeUnique<TcpController>(
                             this, socket, tcp_key, tcp_options));
+    // Note this socket/TCP connection should not bind to any port, though it
+    // does have a tcp_key. On server side, only the listener socket is bounded.
     socket->tcp_con = connections_.at(tcp_key).get();
+
+    // Deliver the SYN packet to this TCP connection so that it will immediately
+    // reply SYN_ACK back.
+    socket->tcp_con->ReceiveNewPacket(std::unique_ptr<Packet>(pkt.Copy()));
   }
 
   // Notify Accept() to get the a new TCP connection socket.
@@ -572,6 +587,24 @@ void Host::PacketsSendListener() {
     send_pkt_queue_.DeQueueAllTo(&packets_to_send);
     // Send to channel.
     channel_->Send(&packets_to_send);
+  }
+}
+
+void Host::DeleteSocketAndConnection(int32 open_file_id) {
+  TcpControllerKey key;
+  std::unique_lock<std::mutex> lock(open_files_table_mutex_);
+  auto it = open_files_table_.find(open_file_id);
+  if (it == open_files_table_.end()) {
+    return;
+  }
+  if (it->second->socket.tcp_con != nullptr) {
+    key = it->second->socket.tcp_con->key();
+  }
+  open_files_table_.erase(it);
+  lock.unlock();
+
+  if (!key.dest_ip.empty() && key.dest_port > 0) {
+    DeleteTcpConnection(key);
   }
 }
 
@@ -648,6 +681,11 @@ bool Host::ShutDownSocket(int32 open_file_id) {
   }
 
   return true;
+}
+
+void Host::ReleasePort(uint32 port) {
+  LOG("release port %d", port);
+  port_pool_->Release(port);
 }
 
 }  // namespace net_stack

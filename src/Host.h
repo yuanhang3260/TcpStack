@@ -91,6 +91,7 @@ class Host {
 
   // Remove a tcp connection and release all its resource.
   void DeleteTcpConnection(const TcpControllerKey& tcp_key);
+  void DeleteSocketAndConnection(int32 open_file_id);
 
   // System calls implementations.
   std::pair<int32, Socket*> CreateNewSocket();
@@ -113,6 +114,9 @@ class Host {
   std::string hostname() const { return hostname_; }
   std::string ip_address() const { return local_ip_address_; }
 
+  // Port resource management.
+  void ReleasePort(uint32 port);
+
  private:
   void Initialize();
 
@@ -132,10 +136,6 @@ class Host {
   bool HandleNewConnection(const Packet& pkt);
 
   void SendBackRST(TcpControllerKey tcp_key);
-
-  // Port resource management.
-  uint32 GetRandomPort();
-  void ReleasePort(uint32 port);
 
   std::string hostname_;
   std::string local_ip_address_;  // Human readable IP address (aa.bb.cc.dd)
