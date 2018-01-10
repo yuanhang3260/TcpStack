@@ -112,6 +112,11 @@ TcpController::TCP_STATE TcpController::state() const {
 
 void TcpController::TearDown() {
   timer_.Stop();
+  syn_timer_.Stop();
+  fin_timer_.Stop();
+  syn_timer_.Stop();
+  close_timer_.Stop();
+  prober_timer_.Stop();
 
   state_cv_.notify_all();
   send_window_cv_.notify_all();
