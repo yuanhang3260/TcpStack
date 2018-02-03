@@ -636,11 +636,14 @@ bool TcpController::HandleACK(std::unique_ptr<Packet> pkt) {
   if (new_send_window_capacity > 0) {
     prober_timer_.Stop();
   }
-
-  // If send window has free space, notify packet send thread.
-  if (send_window_.free_space() > 0 || send_window_.capacity() == 0) {
+  // If send window has free space, or capacity becomes zero and prober timer
+  // is not running, notify packet send thread.
+  if (send_window_.free_space() > 0 ||
+      (send_window_.capacity() == 0 &&
+       prober_timer_.state() != Timer::STARTED)) {
     send_window_cv_.notify_one();
   }
+
   bool send_window_empty = (send_window_.NumPacketsToAck() == 0);
   send_window_lock.unlock();
 
